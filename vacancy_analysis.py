@@ -268,19 +268,27 @@ with DAG(
             "vacancy_id", "skill_id"
         ]
         
-        @task(task_id="split_data_to_dataframes")
-        def split_data_to_dataframes(json_output_file):
+        @task(task_id="fetch_currency_rates")
+        def fetch_currency_rates():
+            response = requests.get(f"https://api.currencyfreaks.com/v2.0/rates/latest?apikey={CURRENCY_TOKEN}")
+            currency_values = response.json()["rates"]
 
-            currency_values = requests.get(f"https://api.currencyfreaks.com/v2.0/rates/latest?apikey={CURRENCY_TOKEN}").json()["rates"]
+            output_file = os.path.join(DATA_PATH, "raw", "currency_rates.json")
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            with open(output_file, "w") as f:
+                json.dump(currency_values, f)
 
-            file = open(json_output_file, 'r', encoding='utf-16').read()
-            data = json.loads(file)
+            return output_file
 
-            vacancy_data = []
-            vacancy_role = []
-            vacancy_work_formats = []
-            employers = {}
-            i = 0
+        
+        @task(task_id="normalize_vacancies")
+        def normalize_vacancies(vacancies_json_path, currency_file):
+            with open(currency_file, "r") as f:
+                currency_values = json.load(f)
+            with open(vacancies_json_path, "r", encoding="utf-16") as f:
+                data = json.load(f)
+            normalized = []
+
             for role_data in data["items"]:
                 for vacancy in role_data["vacancies"]:
                     if not("id" in vacancy["employer"]): continue
@@ -292,7 +300,7 @@ with DAG(
                         if salary_from: salary_from = convert_to_RUB(salary_from, currency, currency_values)
                         if salary_to: salary_to = convert_to_RUB(salary_to, currency, currency_values)
                     
-                    vacancy_data.append([
+                    normalized.append([
                         int(vacancy["id"]),
                         vacancy["area"]["name"],
                         convert_with_checking(float, vacancy["address"], "lat"),
@@ -309,20 +317,28 @@ with DAG(
                         vacancy["experience"]["name"],
                         vacancy["employment"]["name"]
                     ])
-                    
-                    vacancy_role.append([
-                        int(vacancy["id"]),
-                        role_data["role_id"]
-                    ])
-                    
-                    vacancy_work_formats += [
-                        [int(vacancy["id"]), work_format["name"].replace("\xa0", " ")]
-                        for work_format in vacancy["work_format"]
-                    ]
-                                
-                    employer = employers.get(vacancy["employer"]["id"], [])
+            
+            output_file = os.path.join(DATA_PATH, "raw", "vacancies.csv")
+            with open(output_file, "w") as f:
+                csv_writer = csv.writer(f)
+                csv_writer.writerows([vacancies_column_names] + normalized)
+
+            return output_file
+
+
+        @task(task_id="normalize_employers")
+        def normalize_employers(vacancies_json_path):
+            with open(vacancies_json_path, "r", encoding="utf-16") as f:
+                data = json.load(f)
+            normalized = {}
+
+            for role_data in data["items"]:
+                for vacancy in role_data["vacancies"]:
+                    if not("id" in vacancy["employer"]): continue
+
+                    employer = normalized.get(vacancy["employer"]["id"], [])
                     if not employer:
-                        employers[int(vacancy["employer"]["id"])] = [
+                        normalized[int(vacancy["employer"]["id"])] = [
                             vacancy["employer"]["name"],
                             None if not("employer_rating" in vacancy["employer"]) else convert_with_checking(float, vacancy["employer"]["employer_rating"], "total_rating"),
                             None if not("employer_rating" in vacancy["employer"]) else convert_with_checking(int, vacancy["employer"]["employer_rating"], "reviews_count"),
@@ -340,39 +356,61 @@ with DAG(
                             employer[2] = reviews
                         if not employer[5] and log_url:
                             employer[5] = log_url
-                                
-            employers = [[key] + value for key, value in employers.items()]
 
-            vacancies_df = pd.DataFrame(vacancy_data, columns=vacancies_column_names)
-            vacancies_df.drop_duplicates(subset=["id"], keep="first", inplace=True)
+            employers = [[key] + value for key, value in normalized.items()]
 
-            employers_df = pd.DataFrame(employers, columns=employers_column_names)
+            output_file = os.path.join(DATA_PATH, "raw", "employers.csv")
+            with open(output_file, "w") as f:
+                csv_writer = csv.writer(f)
+                csv_writer.writerows([employers_column_names] + normalized)
 
-            vacancy_roles_df = pd.DataFrame(vacancy_role, columns=vacancy_roles_column_names)
-            vacancy_roles_df.drop_duplicates(keep="first", inplace=True)
+            return output_file
 
-            vacancy_work_formats_df = pd.DataFrame(vacancy_work_formats, columns=vacancy_work_formats_column_names)
-            vacancy_work_formats_df.drop_duplicates(keep="first", inplace=True)
 
-            output_dir = os.path.join(DATA_PATH, "raw")
-            os.makedirs(output_dir, exist_ok=True)
+        @task(task_id="normalize_vacancy_role")
+        def normalize_vacancy_role(vacancies_json_path):
+            with open(vacancies_json_path, "r", encoding="utf-16") as f:
+               data = json.load(f)
+            normalized = []
 
-            vacancies_file = os.path.join(output_dir, "vacancies.csv")
-            employers_file = os.path.join(output_dir, "employers.csv")
-            roles_file = os.path.join(output_dir, "vacancy_roles.csv")
-            work_formats_file = os.path.join(output_dir, "vacancy_work_formats.csv")
+            for role_data in data["items"]:
+               for vacancy in role_data["vacancies"]:
+                   if not("id" in vacancy["employer"]): continue
 
-            vacancies_df.to_csv(vacancies_file, index=False)
-            employers_df.to_csv(employers_file, index=False)
-            vacancy_roles_df.to_csv(roles_file, index=False)
-            vacancy_work_formats_df.to_csv(work_formats_file, index=False)
+                   normalized.append([
+                        int(vacancy["id"]),
+                        role_data["role_id"]
+                    ])
+            
+            output_file = os.path.join(DATA_PATH, "raw", "vacancy_roles.csv")
+            with open(output_file, "w") as f:
+                csv_writer = csv.writer(f)
+                csv_writer.writerows([vacancy_roles_column_names] + normalized)
 
-            return {
-                "vacancies": vacancies_file,
-                "employers": employers_file,
-                "roles": roles_file,
-                "work_formats": work_formats_file
-            }
+            return output_file
+            
+
+        @task(task_id="normalize_vacancy_work_formats")
+        def normalize_vacancy_work_formats(vacancies_json_path):
+            with open(vacancies_json_path, "r", encoding="utf-16") as f:
+               data = json.load(f)
+            normalized = []
+
+            for role_data in data["items"]:
+                for vacancy in role_data["vacancies"]:
+                    if not("id" in vacancy["employer"]): continue
+
+                    normalized += [
+                        [int(vacancy["id"]), work_format["name"].replace("\xa0", " ")]
+                        for work_format in vacancy["work_format"]
+                    ]
+
+            output_file = os.path.join(DATA_PATH, "raw", "vacancy_work_formats.csv")
+            with open(output_file, "w") as f:
+                csv_writer = csv.writer(f)
+                csv_writer.writerows([vacancy_work_formats_column_names] + normalized)
+
+            return output_file
 
 
         @task(task_id="deal_with_nan_values")
@@ -595,6 +633,7 @@ with DAG(
                 "skills": hhru_skills_file
             }
 
+
         @task.branch(task_id="choice_to_add_skills_to_db")
         def choice_to_add_skills_to_db(habr_file, getmatch_file, hhru_file):
             conn = BaseHook.get_connection("vacancy_db")
@@ -694,7 +733,14 @@ with DAG(
             return vacancy_skills_file
 
 
-        split_data_to_dataframes_task = split_data_to_dataframes(extract_vacancies_from_api_task)
+        fetch_currency_rates_task = fetch_currency_rates()
+        normalize_vacancies_task = normalize_vacancies(
+            extract_vacancies_from_api_task,
+            fetch_currency_rates_task
+        )
+        normalize_employers_task = normalize_employers(extract_vacancies_from_api_task)
+        normalize_vacancy_role_task = normalize_vacancy_role(extract_vacancies_from_api_task)
+        normalize_vacancy_work_formats_task = normalize_vacancy_work_formats(extract_vacancies_from_api_task)
         deal_with_nan_values_task = deal_with_nan_values(split_data_to_dataframes_task)
         parsing_skills_from_habr_task = parsing_skills_from_habr()
         parsing_skills_from_getmatch_task = parsing_skills_from_getmatch()
@@ -706,7 +752,8 @@ with DAG(
         )
         get_skills_from_requirements_task = get_skills_from_requirements(extract_vacancies_description_task["requirements"])
 
-        split_data_to_dataframes_task >> deal_with_nan_values_task
+        fetch_currency_rates_task >> [normalize_vacancies_task, normalize_employers_task, normalize_vacancy_role_task, normalize_vacancy_work_formats_task]
+        [normalize_vacancies_task, normalize_employers_task, normalize_vacancy_role_task, normalize_vacancy_work_formats_task] >> deal_with_nan_values_task
         deal_with_nan_values_task >> parsing_skills_from_habr_task
         parsing_skills_from_habr_task >> parsing_skills_from_getmatch_task
         parsing_skills_from_getmatch_task >> extract_vacancies_description_task
