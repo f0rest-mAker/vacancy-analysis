@@ -195,6 +195,23 @@ def get_similar_skills(vacancies_id, text, model, skills_in_model, tech_skills):
     return [(vacancies_id, tech_skills[skill]) for skill in found_skills]
 
 
+def makedir(directory: str, filename: str) -> str:
+    '''
+        Функция для создания недостающих катологов для файла.  
+
+        Аргументы:  
+        - directory: название папки, в которой будет находиться filename
+        - filename: название файла
+
+        Выход:  
+        Путь вида '{DATA_PATH}/directory/filename'
+    '''
+    output_dir = os.path.join(DATA_PATH, directory)
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, filename)
+    return output_file
+
+
 with DAG(
     "vacancy_analysis",
     default_args={
@@ -273,8 +290,8 @@ with DAG(
             response = requests.get(f"https://api.currencyfreaks.com/v2.0/rates/latest?apikey={CURRENCY_TOKEN}")
             currency_values = response.json()["rates"]
 
-            output_file = os.path.join(DATA_PATH, "raw", "currency_rates.json")
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            output_file = makedir("raw", "currency_rates.json")
+
             with open(output_file, "w") as f:
                 json.dump(currency_values, f)
 
@@ -318,7 +335,8 @@ with DAG(
                         vacancy["employment"]["name"]
                     ])
             
-            output_file = os.path.join(DATA_PATH, "raw", "vacancies.csv")
+            output_file = makedir("raw", "vacancies.csv")
+
             with open(output_file, "w") as f:
                 csv_writer = csv.writer(f)
                 csv_writer.writerows([vacancies_column_names] + normalized)
@@ -359,7 +377,8 @@ with DAG(
 
             employers = [[key] + value for key, value in normalized.items()]
 
-            output_file = os.path.join(DATA_PATH, "raw", "employers.csv")
+            output_file = makedir("raw", "employers.csv")
+
             with open(output_file, "w") as f:
                 csv_writer = csv.writer(f)
                 csv_writer.writerows([employers_column_names] + normalized)
@@ -382,7 +401,8 @@ with DAG(
                         role_data["role_id"]
                     ])
             
-            output_file = os.path.join(DATA_PATH, "raw", "vacancy_roles.csv")
+            output_file = makedir("raw", "vacancy_roles.csv")
+            
             with open(output_file, "w") as f:
                 csv_writer = csv.writer(f)
                 csv_writer.writerows([vacancy_roles_column_names] + normalized)
@@ -405,7 +425,8 @@ with DAG(
                         for work_format in vacancy["work_format"]
                     ]
 
-            output_file = os.path.join(DATA_PATH, "raw", "vacancy_work_formats.csv")
+            output_file = makedir("raw", "vacancy_work_formats.csv")
+            
             with open(output_file, "w") as f:
                 csv_writer = csv.writer(f)
                 csv_writer.writerows([vacancy_work_formats_column_names] + normalized)
@@ -431,9 +452,9 @@ with DAG(
             print("[-] Количество null значений в vacancies_df:")
             print(vacancies_df.isnull().sum())
 
-            output_file = os.path.join(DATA_PATH, "processed", "vacancies_without_invalid_salaries.csv")
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
-            df.to_csv(output_file, index=False)
+            output_file = makedir("processed", "vacancies_without_invalid_salaries.csv")
+            
+            vacancies_df.to_csv(output_file, index=False)
             return output_file
         
 
@@ -486,16 +507,16 @@ with DAG(
 
             vacancies_df.loc[:, ['latitude', 'longitude']] = vacancies_df["area"].apply(lambda x: coordinates[x]).values.tolist()
 
-            output_vacancies = os.path.join(DATA_PATH, "processed", "vacancies_with_fixed_areas.csv")
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
-            df.to_csv(output_file, index=False)
+            output_vacancies = makedir("processed", "vacancies_with_fixed_areas.csv")
+            
+            vacancies_df.to_csv(output_file, index=False)
             return {"vacancies_path": output_vacancies, "sql_path": output_sql}
 
 
         @task.branch(task_id="check_new_coordinates")
         def check_new_coordinates(result):
             if result["sql_path"]:
-                return "add_new_skills_to_db"
+                return "add_new_coordinates_to_db"
             return "skip_add_coordinates"
 
 
@@ -525,8 +546,7 @@ with DAG(
                 if i % 10 == 0:
                     print(i)
 
-            habr_skills_file = os.path.join(DATA_PATH, "raw", "habr_skills.txt")
-            os.makedirs(habr_skills_file, exist_ok=True)
+            habr_skills_file = makedir("raw", "habr_skills.txt")
             
             with open(habr_skills_file, "w") as file:
                 file.write("\n".join(parsed_skills))
@@ -556,8 +576,7 @@ with DAG(
                 if page % 10 == 0:
                     print(f"{page} done")
 
-            getmatch_skills_file = os.path.join(DATA_PATH, "raw", "getmatch_skills.txt")
-            os.makedirs(getmatch_skills_file, exist_ok=True)
+            getmatch_skills_file = makedir("raw", "getmatch_skills.txt")
             
             with open(getmatch_skills_file, "w") as file:
                 file.write("\n".join(parsed_skills))
@@ -589,8 +608,7 @@ with DAG(
                     print(i, "Done")
                 i += 1
 
-            requirements_json = os.path.join(DATA_PATH, "raw", "vacancies_requirements.json")
-            os.makedirs(requirements_json, exist_ok=True)
+            requirements_json = makedir("raw", "vacancies_requirements.json")
 
             requirements_to_save = []
             for vacancy_id, requirement in requirements:
@@ -600,9 +618,8 @@ with DAG(
             with open(requirements_json, 'w') as file:
                 json.dump(to_save, file)
 
-            hhru_skills_file = os.path.join(DATA_PATH, "raw", "vacancies_requirements.json")
-            os.makedirs(requirements_json, exist_ok=True)
-
+            hhru_skills_file = makedir("raw", "hhru_skills.txt")
+            
             with open(hhru_skills_file) as file:
                 file.write("\n".join(skills))
             
@@ -643,8 +660,7 @@ with DAG(
             insert_skills_sql = None
 
             if len(new_skills) != 0:
-                insert_skills_sql = os.path.join(DATA_PATH, "processed", "insert_skills.sql")
-                os.makedirs(insert_skills_sql, exist_ok=True)
+                insert_skills_sql = makedir("processed", "insert_skills.sql")
 
                 with open(insert_skills_sql, "w") as file:
                     file.write("INSERT INTO skills (name) VALUES\n")
@@ -716,10 +732,8 @@ with DAG(
 
             vacancy_skills_df = pd.DataFrame(vacancy_skills, columns=vacancy_skills_column_names)
 
-            output_dir = os.path.join(DATA_PATH, "processed")
-            os.makedirs(output_dir, exist_ok=True)
+            vacancy_skills_file = makedir("processed", "vacancy_skills.csv")
 
-            vacancy_skills_file = os.path.join(output_dir, "vacancy_skills.csv")
             vacancy_skills_df.to_csv(vacancy_skills_file, index=False)
 
             return vacancy_skills_file
@@ -780,4 +794,5 @@ with DAG(
         # [Выделение скиллов из описаний]
         start_skills_dummy >> get_skills_from_requirements_task
     
+    start >> extract_vacancies_from_api_task
     extract_vacancies_from_api_task >> vacancy_data_process
