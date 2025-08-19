@@ -413,41 +413,34 @@ with DAG(
             return output_file
 
 
-        @task(task_id="deal_with_nan_values")
-        def deal_with_nan_values(csv_files_path):
-            conn = BaseHook.get_connection("vacancy_db")
-
-            connection = psycopg2.connect(
-                host=conn.host,
-                port=conn.port,
-                user=conn.login,
-                password=conn.password,
-                dbname=conn.schema
-            )
-            cursor = connection.cursor()
-
-            loc = Nominatim(user_agent="GetLoc")
-
-            employers_df = pd.read_csv(csv_files_path["employers.csv"])
-            vacancies_df = pd.read_csv(csv_files_path["vacancies"])
-            vacancy_roles_df = pd.read_csv(csv_files_path["roles"])
-            vacancy_work_formats_df = pd.read_csv(csv_files_path["work_formats"])
-
+        @task(task_id="drop_invalid_salaries")
+        def drop_invalid_salaries(vacancies_csv):
+            vacancies_df = pd.read_csv(vacancies_csv)
+            
             print("[#] Обработка null значений с вакансии")
             print("[#] До обработки")
-
             print(f"[-] Общее количество записей: {vacancies_df['id'].count()}")
             print("[-] Количество null значений в vacancies_df:")
             print(vacancies_df.isnull().sum())
-
             nulls_id = vacancies_df[
-                vacancies_df['salary_from'].isnull() | (vacancies_df['salary_from'].isnull() & vacancies_df['salary_to'].isnull())
-            ]["id"].copy()
+               (vacancies_df['salary_from'].isnull() & vacancies_df['salary_to'].isnull())
+            ]["id"]
             print(f"[-] Количество null значений с salary_from или salary_from & salary_to: {len(nulls_id.index)}")
-            print("[&] Удаляем вакансии с salary_from == null или salary_from & salary_to == null...")
+            print("[&] Удаляем вакансии с salary_from & salary_to == null...")
             vacancies_df.drop(nulls_id.index, inplace=True)
+            print("[-] Количество null значений в vacancies_df:")
+            print(vacancies_df.isnull().sum())
 
-            print("[&] Заполняем долготу и широту по названию региона...")
+            output_file = os.path.join(DATA_PATH, "processed", "vacancies_without_invalid_salaries.csv")
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            df.to_csv(output_file, index=False)
+            return output_file
+        
+
+        @task(task_id="fill_null_areas_and_generate_sql")
+        def fill_null_areas(vacancies_without_invalid_salaries):
+            vacancies_df = pd.read_csv(vacancies_without_invalid_salaries)
+            loc = Nominatim(user_agent="GetLoc")
             areas_to_fix = vacancies_df[(vacancies_df['latitude'].isnull()) | (vacancies_df['longitude'].isnull())]["area"].unique()
 
             cursor.execute("SELECT name, latitude, longitude FROM area_coordinates")
@@ -455,7 +448,7 @@ with DAG(
             coordinates = {area[0]: [float(area[1]), float(area[2])] for area in cursor.fetchall()}
             new_coordinates = {}
             for area in areas_to_fix:
-                if not(coordinates.get(area, [])):
+                if area not in coordinates:
                     getLoc = loc.geocode(area)
                     if getLoc:
                         latitude = getLoc.latitude
@@ -463,8 +456,11 @@ with DAG(
                         coordinates[area] = [latitude, longitude]
                         new_coordinates[area] = [latitude, longitude]
 
+            output_sql = None
             if new_coordinates:
-                with open("add_new_coordinates.sql", "w") as file:
+                output_sql = os.path.join(DATA_PATH, "processed", "add_new_coordinates.sql")
+                os.makedirs(os.path.dirname(output_sql), exist_ok=True)
+                with open(output_sql, "w") as file:
                     file.write("INSERT INTO area_coordinates (name, latitude, longitude) VALUES\n")
                     file.write(
                         ",\n".join(
@@ -474,8 +470,6 @@ with DAG(
                             ]
                         ) + ";"
                     )
-
-            have_null_areas = False
 
             if len(coordinates.keys()) == len(areas_to_fix):
                 print("[&] Есть все координаты, меняем null...")
@@ -492,40 +486,28 @@ with DAG(
 
             vacancies_df.loc[:, ['latitude', 'longitude']] = vacancies_df["area"].apply(lambda x: coordinates[x]).values.tolist()
 
-            print("[#] После обработки")
-            print(f"[-] Общее количество записей: {vacancies_df["id"].count()}")
-            print(vacancies_df.isnull().sum())
+            output_vacancies = os.path.join(DATA_PATH, "processed", "vacancies_with_fixed_areas.csv")
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            df.to_csv(output_file, index=False)
+            return {"vacancies_path": output_vacancies, "sql_path": output_sql}
 
-            nulls_id = sorted(nulls_id.values.tolist() + null_areas.values.tolist()) if have_null_areas else sorted(nulls_id.values.tolist())
-        
-            dropping_vacancy_roles_index = vacancy_roles_df[vacancy_roles_df["vacancy_id"].isin(nulls_id)].index
-            vacancy_roles_df.drop(dropping_vacancy_roles_index, inplace=True)
 
-            dropping_vacancy_work_formats_index = vacancy_work_formats_df[vacancy_work_formats_df["vacancy_id"].isin(nulls_id)].index
-            vacancy_work_formats_df.drop(dropping_vacancy_work_formats_index, inplace=True)
+        @task.branch(task_id="check_new_coordinates")
+        def check_new_coordinates(result):
+            if result["sql_path"]:
+                return "add_new_skills_to_db"
+            return "skip_add_coordinates"
 
-            employers_df = employers_df[employers_df["id"].isin(vacancies_df["company_id"].values.tolist())]
 
-            output_dir = os.path.join(DATA_PATH, "processed")
-            os.makedirs(output_dir, exist_ok=True)
+        add_new_coordinates_to_db_task = PostgresOperator(
+            task_id="add_new_coordinates_to_db",
+            postgres_conn_id="vacancy_db",
+            sql="{{ ti.xcom_pull(task_id='fill_null_areas_and_generate_sql')['sql_path'] }}"
+        )
 
-            vacancies_file = os.path.join(output_dir, "vacancies.csv")
-            employers_file = os.path.join(output_dir, "employers.csv")
-            roles_file = os.path.join(output_dir, "vacancy_roles.csv")
-            work_formats_file = os.path.join(output_dir, "vacancy_work_formats.csv")
+        skip_add_coordinates = DummyOperator(task_id="skip_add_coordinates")
 
-            vacancies_df.to_csv(vacancies_file, index=False)
-            employers_df.to_csv(employers_file, index=False)
-            vacancy_roles_df.to_csv(roles_file, index=False)
-            vacancy_work_formats_df.to_csv(work_formats_file, index=False)
-
-            return {
-                "vacancies": vacancies_file,
-                "employers": employers_file,
-                "roles": roles_file,
-                "work_formats": work_formats_file
-            }
-
+        start_parsing_dummy = DummyOperator(task_id="start_parsing")
 
         @task(task_id="parsing_skills_from_habr")
         def parsing_skills_from_habr():
@@ -543,10 +525,8 @@ with DAG(
                 if i % 10 == 0:
                     print(i)
 
-            output_dir = os.path.join(DATA_PATH, "raw")
-            os.makedirs(output_dir, exist_ok=True)
-
-            habr_skills_file = os.path.join(output_dir, "habr_skills.txt")
+            habr_skills_file = os.path.join(DATA_PATH, "raw", "habr_skills.txt")
+            os.makedirs(habr_skills_file, exist_ok=True)
             
             with open(habr_skills_file, "w") as file:
                 file.write("\n".join(parsed_skills))
@@ -576,10 +556,8 @@ with DAG(
                 if page % 10 == 0:
                     print(f"{page} done")
 
-            output_dir = os.path.join(DATA_PATH, "raw")
-            os.makedirs(output_dir, exist_ok=True)
-
-            getmatch_skills_file = os.path.join(output_dir, "getmatch_skills.txt")
+            getmatch_skills_file = os.path.join(DATA_PATH, "raw", "getmatch_skills.txt")
+            os.makedirs(getmatch_skills_file, exist_ok=True)
             
             with open(getmatch_skills_file, "w") as file:
                 file.write("\n".join(parsed_skills))
@@ -587,9 +565,9 @@ with DAG(
             return getmatch_skills_file
 
 
-        @task(task_id="extract_vacancies_requirements")
-        def extract_vacancies_requirements(processed_csv_files):
-            vacancies_df = pd.read_csv(processed_csv_files["vacancies"])
+        @task(task_id="extract_description_and_skills_from_hhru")
+        def extract_description_and_skills_from_hhru(result):
+            vacancies_df = pd.read_csv(result["vacancies_path"])
             vacancy_ids = vacancies_df["id"].values
             requirements = []
             skills = set()
@@ -611,20 +589,20 @@ with DAG(
                     print(i, "Done")
                 i += 1
 
-            output_dir = os.path.join(DATA_PATH, "raw")
-            os.makedirs(output_dir, exist_ok=True)
+            requirements_json = os.path.join(DATA_PATH, "raw", "vacancies_requirements.json")
+            os.makedirs(requirements_json, exist_ok=True)
 
             requirements_to_save = []
             for vacancy_id, requirement in requirements:
                 requirements_to_save.append({"vacancy_id": vacancy_id, "requirement": requirement})
             to_save = {"items": requirements_to_save}
-            requirements_json = os.path.join(output_dir, "vacancies_requirements.json")
 
             with open(requirements_json, 'w') as file:
                 json.dump(to_save, file)
 
-            hhru_skills_file = os.path.join(output_dir, "hhru_skills.txt")
-            
+            hhru_skills_file = os.path.join(DATA_PATH, "raw", "vacancies_requirements.json")
+            os.makedirs(requirements_json, exist_ok=True)
+
             with open(hhru_skills_file) as file:
                 file.write("\n".join(skills))
             
@@ -634,8 +612,8 @@ with DAG(
             }
 
 
-        @task.branch(task_id="choice_to_add_skills_to_db")
-        def choice_to_add_skills_to_db(habr_file, getmatch_file, hhru_file):
+        @task(task_id="union_parsed_skills_and_generate_sql")
+        def union_parsed_skills_and_generate_sql(habr_file, getmatch_file, hhru_file):
             conn = BaseHook.get_connection("vacancy_db")
 
             connection = psycopg2.connect(
@@ -662,21 +640,35 @@ with DAG(
             getmatch_file.close()
 
             new_skills = parsed_skills.difference(skills)
+            insert_skills_sql = None
+
             if len(new_skills) != 0:
-                with open(DATA_PATH + "insert_skills.sql", "w") as file:
+                insert_skills_sql = os.path.join(DATA_PATH, "processed", "insert_skills.sql")
+                os.makedirs(insert_skills_sql, exist_ok=True)
+
+                with open(insert_skills_sql, "w") as file:
                     file.write("INSERT INTO skills (name) VALUES\n")
                     file.write(",\n".join([f"('{skill}')" for skill in parsed_skills.difference(skills)]) + ";")
+            
+            return insert_skills_sql
+
+
+        @task.branch(task_id="check_new_skills")
+        def check_new_skills(insert_skills_sql):
+            if insert_skills_sql:
                 return "add_new_skills_to_db"
-            else:
-                return "extract_vacancies_requirements"
+            return "extract_description_and_skills_from_hhru"
 
 
+        skip_add_skills = DummyOperator(task_id="skip_add_skills")
+                
         add_new_skills_to_db_task = PostgresOperator(
             task_id="add_new_skills_to_db",
             postgres_conn_id="vacancy_db",
-            sql=DATA_PATH + "insert_skills.sql"
+            sql="{{ ti.xcom_pull(task_id='union_parsed_skills_and_generate_sql') }}"
         )
 
+        start_skills_dummy = DummyOperator(task_id="start_working_with_skills")
 
         @task(task_id="get_skills_from_requirements")
         def get_skills_from_requirements(requirements_json):
@@ -733,6 +725,7 @@ with DAG(
             return vacancy_skills_file
 
 
+        # [Нормализация данных]
         fetch_currency_rates_task = fetch_currency_rates()
         normalize_vacancies_task = normalize_vacancies(
             extract_vacancies_from_api_task,
@@ -741,24 +734,50 @@ with DAG(
         normalize_employers_task = normalize_employers(extract_vacancies_from_api_task)
         normalize_vacancy_role_task = normalize_vacancy_role(extract_vacancies_from_api_task)
         normalize_vacancy_work_formats_task = normalize_vacancy_work_formats(extract_vacancies_from_api_task)
-        deal_with_nan_values_task = deal_with_nan_values(split_data_to_dataframes_task)
+
+        # [Очистка null]
+        drop_invalid_salaries_task = drop_invalid_salaries(normalize_vacancies_task)
+        fill_null_areas_task = fill_null_areas(drop_invalid_salaries_task)
+        check_new_coordinates_task = check_new_coordinates(fill_null_areas_task)
+
+        # [Парсинг скилов]
         parsing_skills_from_habr_task = parsing_skills_from_habr()
         parsing_skills_from_getmatch_task = parsing_skills_from_getmatch()
-        extract_vacancies_description_task = extract_vacancies_requirements(deal_with_nan_values_task)
-        choice_to_create_skill_insert_sql_task = choice_to_add_skills_to_db(
+        extract_description_and_skills_from_hhru_task = extract_description_and_skills_from_hhru(fill_null_areas_task)
+        
+        # [Добавление скиллов]
+        union_parsed_skills_and_generate_sql_task = union_parsed_skills_and_generate_sql(
             parsing_skills_from_habr_task,
             parsing_skills_from_getmatch_task,
-            extract_vacancies_description_task["skills"]
+            extract_description_and_skills_from_hhru["skills"]
         )
-        get_skills_from_requirements_task = get_skills_from_requirements(extract_vacancies_description_task["requirements"])
+        check_new_skills_task = check_new_skills(union_parsed_skills_and_generate_sql)
+        
+        # [Выделение скилов из описаний]
+        get_skills_from_requirements_task = get_skills_from_requirements(
+            extract_description_and_skills_from_hhru["requirements"]
+        )
 
+        # [Нормализация данных]
         fetch_currency_rates_task >> [normalize_vacancies_task, normalize_employers_task, normalize_vacancy_role_task, normalize_vacancy_work_formats_task]
-        [normalize_vacancies_task, normalize_employers_task, normalize_vacancy_role_task, normalize_vacancy_work_formats_task] >> deal_with_nan_values_task
-        deal_with_nan_values_task >> parsing_skills_from_habr_task
-        parsing_skills_from_habr_task >> parsing_skills_from_getmatch_task
-        parsing_skills_from_getmatch_task >> extract_vacancies_description_task
-        extract_vacancies_description_task >> choice_to_create_skill_insert_sql_task
-        choice_to_create_skill_insert_sql_task >> [add_new_skills_to_db_task, get_skills_from_requirements_task]
-        add_new_skills_to_db_task >> get_skills_from_requirements_task
+        [normalize_vacancies_task, normalize_employers_task, normalize_vacancy_role_task, normalize_vacancy_work_formats_task] >> drop_invalid_salaries_task
+        
+        # [Очистка null]
+        drop_invalid_salaries_task >> fill_null_areas_task
+        fill_null_areas_task >> check_new_coordinates_task
+        check_new_coordinates_task >> [add_new_coordinates_to_db_task, skip_add_coordinates]
+        [add_new_coordinates_to_db_task, skip_add_coordinates] >> start_parsing_dummy
+
+        # [Парсинг скилов]
+        start_parsing_dummy >> [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task, extract_vacancies_description_task]
+        [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task, extract_vacancies_description_task] >> union_parsed_skills_and_generate_sql_task
+
+        # [Добавление скиллов]
+        union_parsed_skills_and_generate_sql_task >> check_new_skills_task
+        check_new_skills_task >> [add_new_skills_to_db_task, skip_add_skills]
+        [add_new_skills_to_db_task, skip_add_skills] >> start_skills_dummy
+        
+        # [Выделение скиллов из описаний]
+        start_skills_dummy >> get_skills_from_requirements_task
     
     extract_vacancies_from_api_task >> vacancy_data_process
