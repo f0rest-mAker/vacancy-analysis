@@ -9,6 +9,7 @@ import time
 import numpy as np
 import gensim.downloader as api
 import nltk
+import os
 import string
 
 from geopy.geocoders import Nominatim
@@ -19,36 +20,37 @@ from typing import List, Tuple, Dict
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-from airflow import DAG
+from airflow.sdk import DAG, task, task_group
 
-from airflow.operators.python import PythonOperator
-from airflow.operators.dummy import DummyOperator
-from airflow.decorators import task
-from airflow.utils.dates import days_ago
-from airflow.utils.task_group import TaskGroup
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+
 from airflow.hooks.base import BaseHook
-from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.models import Variable
 
-DATA_PATH = os.getenv("AIRFLOW_VAR_DATA_PATH", "/home/ruzal/Desktop/utils/airflow/data/vacancy-analysis")
+DATA_PATH = os.getenv(
+    "AIRFLOW_VAR_DATA_PATH",
+    "/home/ruzal/Desktop/utils/airflow/data/vacancy-analysis"
+)
 CURRENCY_TOKEN = Variable.get("currency_token")
 
 
-def convert_with_checking(func: object, dict: dict, target: str) -> None | object:
+def convert_with_checking(func: object, source: dict, target: str) -> None | object:
     '''
-        Функция конертации с проверкой на наличие поля в dict.
+        Функция конертации с проверкой на наличие поля в source.
         
         Аргументы:
         - func: функция приведения к типу (`int`, `str`, `float` и т.д.).
-        - dict: словарь, в котором нужно проверить на наличие поля.
+        - source: словарь, в котором нужно проверить на наличие поля.
         - target: поле в словаре.
 
         Вывод:  
         Сконвертированное значение ключа поля или `None`.
     '''
 
-    if dict:
-        value = dict[target]
+    if source:
+        value = source[target]
         if value:
             return func(value)
         return None
@@ -175,7 +177,7 @@ def extract_requirements_segment(html: str) -> str:
     return ' '.join(lines[5:30])
 
 
-def get_similar_skills(vacancies_id, text, model, skills_in_model, tech_skills):
+def get_similar_skills(vacancies_id, text, model, skills_in_model, tech_skills, all_stop_words):
     lower_text = text.lower()
     
     tokens = [t for t in word_tokenize(lower_text) if t in model]
@@ -217,15 +219,12 @@ with DAG(
     default_args={
         "owner": "airflow",
     },
-    schedule_interval='none'
+    schedule=None
 ) as dag:
-
-    start = DummyOperator(task_id="start")
 
     @task(task_id="extract_vacancies_from_api")
     def extract_vacancies_from_api():
         conn = BaseHook.get_connection("vacancy_db")
-
         connection = psycopg2.connect(
             host=conn.host,
             port=conn.port,
@@ -296,7 +295,10 @@ with DAG(
 
     
     @task(task_id="normalize_vacancies")
-    def normalize_vacancies(vacancies_json_path, currency_file):
+    def normalize_vacancies(**context):
+        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
+        currency_file = context["ti"].xcom_pull(task_ids="fetch_currency_rates")
+        
         with open(currency_file, "r") as f:
             currency_values = json.load(f)
         with open(vacancies_json_path, "r", encoding="utf-16") as f:
@@ -311,8 +313,10 @@ with DAG(
                 salary_to = convert_with_checking(int, vacancy["salary_range"], "to")
 
                 if vacancy["salary_range"] and (currency := vacancy["salary_range"]["currency"]) != "RUR":
-                    if salary_from: salary_from = convert_to_RUB(salary_from, currency, currency_values)
-                    if salary_to: salary_to = convert_to_RUB(salary_to, currency, currency_values)
+                    if salary_from:
+                        salary_from = convert_to_RUB(salary_from, currency, currency_values)
+                    if salary_to:
+                        salary_to = convert_to_RUB(salary_to, currency, currency_values)
                 
                 normalized.append([
                     int(vacancy["id"]),
@@ -342,7 +346,8 @@ with DAG(
 
 
     @task(task_id="normalize_employers")
-    def normalize_employers(vacancies_json_path):
+    def normalize_employers(**context):
+        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
         with open(vacancies_json_path, "r", encoding="utf-16") as f:
             data = json.load(f)
         normalized = {}
@@ -378,13 +383,14 @@ with DAG(
 
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
-            csv_writer.writerows([employers_column_names] + normalized)
+            csv_writer.writerows([employers_column_names] + employers)
 
         return output_file
 
 
     @task(task_id="normalize_vacancy_role")
-    def normalize_vacancy_role(vacancies_json_path):
+    def normalize_vacancy_role(**context):
+        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
         with open(vacancies_json_path, "r", encoding="utf-16") as f:
             data = json.load(f)
         normalized = []
@@ -408,7 +414,8 @@ with DAG(
         
 
     @task(task_id="normalize_vacancy_work_formats")
-    def normalize_vacancy_work_formats(vacancies_json_path):
+    def normalize_vacancy_work_formats(**context):
+        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
         with open(vacancies_json_path, "r", encoding="utf-16") as f:
             data = json.load(f)
         normalized = []
@@ -432,8 +439,10 @@ with DAG(
 
 
     @task(task_id="drop_invalid_salaries")
-    def drop_invalid_salaries(vacancies_csv):
-        vacancies_df = pd.read_csv(vacancies_csv)
+    def drop_invalid_salaries(**context):
+        normalized_vacancies_csv = context["ti"].xcom_pull(task_ids="normalize_vacancies")
+
+        vacancies_df = pd.read_csv(normalized_vacancies_csv)
         
         print("[#] Обработка null значений с вакансии")
         print("[#] До обработки")
@@ -443,20 +452,30 @@ with DAG(
         nulls_id = vacancies_df[
             (vacancies_df['salary_from'].isnull() & vacancies_df['salary_to'].isnull())
         ]["id"]
-        print(f"[-] Количество null значений с salary_from или salary_from & salary_to: {len(nulls_id.index)}")
+        print("[-] Количество null значений с salary_from или " + \
+            f"salary_from & salary_to: {len(nulls_id.index)}")
         print("[&] Удаляем вакансии с salary_from & salary_to == null...")
         vacancies_df.drop(nulls_id.index, inplace=True)
         print("[-] Количество null значений в vacancies_df:")
         print(vacancies_df.isnull().sum())
 
         output_file = makedir("processed", "vacancies_without_invalid_salaries.csv")
-        
         vacancies_df.to_csv(output_file, index=False)
         return output_file
-    
 
     @task(task_id="fill_null_areas_and_generate_sql")
-    def fill_null_areas(vacancies_without_invalid_salaries):
+    def fill_null_areas(**context):
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+
+        vacancies_without_invalid_salaries = context["ti"].xcom_pull(task_ids="drop_invalid_salaries")
         vacancies_df = pd.read_csv(vacancies_without_invalid_salaries)
         loc = Nominatim(user_agent="GetLoc")
         areas_to_fix = vacancies_df[(vacancies_df['latitude'].isnull()) | (vacancies_df['longitude'].isnull())]["area"].unique()
@@ -493,8 +512,7 @@ with DAG(
             print("[&] Есть все координаты, меняем null...")
         else:
             print(f"[-] Количество ненайденных местностей: {len(areas_to_fix) - len(coordinates)}")
-            print(f"[-] Сбрасываем их.", end=" ")
-            have_null_areas = True
+            print("[-] Сбрасываем их.", end=" ")
             null_areas = vacancies_df[
                 ~vacancies_df['area'].isin(coordinates.keys())
             ]["id"].copy()
@@ -506,26 +524,17 @@ with DAG(
 
         output_vacancies = makedir("processed", "vacancies_with_fixed_areas.csv")
         
-        vacancies_df.to_csv(output_file, index=False)
+        vacancies_df.to_csv(output_vacancies, index=False)
         return {"vacancies_path": output_vacancies, "sql_path": output_sql}
 
 
     @task.branch(task_id="check_new_coordinates")
-    def check_new_coordinates(result):
-        if result["sql_path"]:
+    def check_new_coordinates(**context):
+        result = context["ti"].xcom_pull(task_ids="fill_null_areas_and_generate_sql", key="sql_path")
+        if result:
             return "add_new_coordinates_to_db"
         return "skip_add_coordinates"
 
-
-    add_new_coordinates_to_db_task = PostgresOperator(
-        task_id="add_new_coordinates_to_db",
-        postgres_conn_id="vacancy_db",
-        sql="{{ ti.xcom_pull(task_id='fill_null_areas_and_generate_sql')['sql_path'] }}"
-    )
-
-    skip_add_coordinates = DummyOperator(task_id="skip_add_coordinates")
-
-    start_parsing_dummy = DummyOperator(task_id="start_parsing")
 
     @task(task_id="parsing_skills_from_habr")
     def parsing_skills_from_habr():
@@ -582,8 +591,9 @@ with DAG(
 
 
     @task(task_id="extract_description_and_skills_from_hhru")
-    def extract_description_and_skills_from_hhru(result):
-        vacancies_df = pd.read_csv(result["vacancies_path"])
+    def extract_description_and_skills_from_hhru(**context):
+        vacancies_path = context["ti"].xcom_pull(task_ids="fill_null_areas_and_generate_sql", key="vacancies_path")
+        vacancies_df = pd.read_csv(vacancies_path)
         vacancy_ids = vacancies_df["id"].values
         requirements = []
         skills = set()
@@ -627,9 +637,12 @@ with DAG(
 
 
     @task(task_id="union_parsed_skills_and_generate_sql")
-    def union_parsed_skills_and_generate_sql(habr_file, getmatch_file, hhru_file):
-        conn = BaseHook.get_connection("vacancy_db")
+    def union_parsed_skills_and_generate_sql(**context):
+        habr_file = context["ti"].xcom_pull(task_ids="parsing_skills_from_habr")
+        getmatch_file = context["ti"].xcom_pull(task_ids="parsing_skills_from_getmatch")
+        hhru_file = context["ti"].xcom_pull(task_ids="extract_description_and_skills_from_hhru", key="skills")
 
+        conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
             port=conn.port,
@@ -667,24 +680,16 @@ with DAG(
 
 
     @task.branch(task_id="check_new_skills")
-    def check_new_skills(insert_skills_sql):
+    def check_new_skills(**context):
+        insert_skills_sql = context["ti"].xcom_pull(task_ids="union_parsed_skills_and_generate_sql")
         if insert_skills_sql:
             return "add_new_skills_to_db"
-        return "extract_description_and_skills_from_hhru"
+        return "skip_add_skills"
 
-
-    skip_add_skills = DummyOperator(task_id="skip_add_skills")
-            
-    add_new_skills_to_db_task = PostgresOperator(
-        task_id="add_new_skills_to_db",
-        postgres_conn_id="vacancy_db",
-        sql="{{ ti.xcom_pull(task_id='union_parsed_skills_and_generate_sql') }}"
-    )
-
-    start_skills_dummy = DummyOperator(task_id="start_working_with_skills")
 
     @task(task_id="get_skills_from_requirements")
-    def get_skills_from_requirements(requirements_json):
+    def get_skills_from_requirements():
+        requirements_json = context["ti"].xcom_pull(task_ids="extract_description_and_skills_from_hhru", key="requirements")
 
         conn = BaseHook.get_connection("vacancy_db")
 
@@ -722,10 +727,9 @@ with DAG(
                 row["requirement"],
                 model,
                 skills_in_model,
-                tech_skills
+                tech_skills,
+                all_stop_words
             )
-
-
 
         vacancy_skills_df = pd.DataFrame(vacancy_skills, columns=vacancy_skills_column_names)
 
@@ -736,67 +740,83 @@ with DAG(
         return vacancy_skills_file
 
 
-    end = DummyOperator(task_id="end")
-
     # [Извлечение]
-    with TaskGroup("extract") as extract_group:
+    @task_group(group_id="extract")
+    def extract():
         extract_vacancies_from_api_task = extract_vacancies_from_api()
         fetch_currency_rates_task = fetch_currency_rates()
-    
-        extract_vacancies_from_api_task >> fetch_currency_rates_task
+
 
     # [Нормализация]
-    with TaskGroup("normalize") as extract_group:
-        normalize_vacancies_task = normalize_vacancies(
-            extract_vacancies_from_api_task,
-            fetch_currency_rates_task
-        )
-        normalize_employers_task = normalize_employers(extract_vacancies_from_api_task)
-        normalize_vacancy_role_task = normalize_vacancy_role(extract_vacancies_from_api_task)
-        normalize_vacancy_work_formats_task = normalize_vacancy_work_formats(extract_vacancies_from_api_task)
+    @task_group(group_id="normalize")
+    def normalize():
+        normalize_vacancies_task = normalize_vacancies()
+        normalize_employers_task = normalize_employers()
+        normalize_vacancy_role_task = normalize_vacancy_role()
+        normalize_vacancy_work_formats_task = normalize_vacancy_work_formats()
 
-        fetch_currency_rates_task >> [normalize_vacancies_task, normalize_employers_task, normalize_vacancy_role_task, normalize_vacancy_work_formats_task]
-    
 
     # [Очистка null]
-    with TaskGroup("clean") as clean_group:
-        drop_invalid_salaries_task = drop_invalid_salaries(normalize_vacancies_task)
-        fill_null_areas_task = fill_null_areas(drop_invalid_salaries_task)
-        check_new_coordinates_task = check_new_coordinates(fill_null_areas_task)
+    @task_group(group_id="clean")
+    def clean():
+        drop_invalid_salaries_task = drop_invalid_salaries()
+        fill_null_areas_task = fill_null_areas()
+        check_new_coordinates_task = check_new_coordinates()
 
-        [normalize_vacancies_task, normalize_employers_task, normalize_vacancy_role_task, normalize_vacancy_work_formats_task] >> drop_invalid_salaries_task
+        add_new_coordinates_to_db_task = SQLExecuteQueryOperator(
+            task_id="add_new_coordinates_to_db",
+            conn_id="vacancy_db",
+            sql="{{ ti.xcom_pull(task_id='fill_null_areas_and_generate_sql')['sql_path'] }}"
+        )
+
+        skip_add_coordinates = EmptyOperator(task_id="skip_add_coordinates")
+
         drop_invalid_salaries_task >> fill_null_areas_task
         fill_null_areas_task >> check_new_coordinates_task
         check_new_coordinates_task >> [add_new_coordinates_to_db_task, skip_add_coordinates]
-        [add_new_coordinates_to_db_task, skip_add_coordinates] >> start_parsing_dummy
+
 
     # [Парсинг скилов]
-    with TaskGroup("skills_parsing") as skills_group:
+    @task_group(group_id="skills_parsing")
+    def skills_parsing():
         parsing_skills_from_habr_task = parsing_skills_from_habr()
         parsing_skills_from_getmatch_task = parsing_skills_from_getmatch()
-        extract_description_and_skills_from_hhru_task = extract_description_and_skills_from_hhru(fill_null_areas_task)
+        extract_description_and_skills_from_hhru_task = extract_description_and_skills_from_hhru()
 
-        start_parsing_dummy >> [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task, extract_vacancies_description_task]
-    
+
     # [Добавление скиллов]
-    with TaskGroup("update_reference") as update_group:
-        union_parsed_skills_and_generate_sql_task = union_parsed_skills_and_generate_sql(
-            parsing_skills_from_habr_task,
-            parsing_skills_from_getmatch_task,
-            extract_description_and_skills_from_hhru["skills"]
-        )
-        check_new_skills_task = check_new_skills(union_parsed_skills_and_generate_sql)
+    @task_group(group_id="update_reference")
+    def update_reference():
+        union_parsed_skills_and_generate_sql_task = union_parsed_skills_and_generate_sql()
+
+        check_new_skills_task = check_new_skills()
     
-        [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task, extract_vacancies_description_task] >> union_parsed_skills_and_generate_sql_task
+        skip_add_skills = EmptyOperator(task_id="skip_add_skills")
+            
+        add_new_skills_to_db_task = SQLExecuteQueryOperator(
+            task_id="add_new_skills_to_db",
+            conn_id="vacancy_db",
+            sql="{{ ti.xcom_pull(task_id='union_parsed_skills_and_generate_sql') }}"
+        )
+
+        union_parsed_skills_and_generate_sql_task >> check_new_skills_task
         check_new_skills_task >> [add_new_skills_to_db_task, skip_add_skills]
-        [add_new_skills_to_db_task, skip_add_skills] >> start_skills_dummy
 
-    # [Выделение скилов из описаний]
-    with TaskGroup("analyze") as analyze_group:
-        get_skills_from_requirements_task = get_skills_from_requirements(
-            extract_description_and_skills_from_hhru["requirements"]
-        )
 
-        start_skills_dummy >> get_skills_from_requirements_task
+    # [Выделение скиллов из описаний]
+    @task_group(group_id="analyze")
+    def analyze():
+        get_skills_from_requirements_task = get_skills_from_requirements()
+
     
-    start >> extract_group >> normalize_group >> clean_group >> skills_group >> update_group >> analyze_group >> end
+    start = EmptyOperator(task_id="start")
+    extract_group = extract()
+    normalize_group = normalize()
+    clean_group = clean()
+    parsing_group = skills_parsing()
+    update_group = update_reference()
+    analyze_group = analyze()
+    end = EmptyOperator(task_id="end")
+
+    start >> extract_group >> normalize_group >> clean_group >> parsing_group >> update_group >> analyze_group >> end
+
