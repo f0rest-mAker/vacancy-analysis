@@ -197,7 +197,7 @@ def get_similar_skills(vacancies_id, text, model, skills_in_model, tech_skills, 
     return [(vacancies_id, tech_skills[skill]) for skill in found_skills]
 
 
-def makedir(directory: str, filename: str) -> str:
+def makefile(directory: str, filename: str) -> str:
     '''
         Функция для создания недостающих катологов для файла.  
 
@@ -221,6 +221,25 @@ with DAG(
     },
     schedule=None
 ) as dag:
+    vacancies_column_names = [
+        'id', 'area', 'latitude', 'longitude', 'archived',
+        'created_at', 'published_at', 'has_test', 'internship',
+        'salary_from', 'salary_to', 'salary_frequency', 'company_id',
+        'experience', 'employment'
+    ]
+    employers_column_names = [
+        'id', 'name', 'total_rating', 'reviews_count',
+        'accredited_it_employer', 'trusted', 'logo_url'
+    ]
+    vacancy_roles_column_names = [
+        'vacancy_id', 'role_id'
+    ]
+    vacancy_work_formats_column_names = [
+        'vacancy_id', 'work_format'
+    ]
+    vacancy_skills_column_names = [
+        "vacancy_id", "skill_id"
+    ]
 
     @task(task_id="extract_vacancies_from_api")
     def extract_vacancies_from_api():
@@ -260,33 +279,13 @@ with DAG(
         
         return output_file
 
-
-    vacancies_column_names = [
-        'id', 'area', 'latitude', 'longitude', 'archived',
-        'created_at', 'published_at', 'has_test', 'internship',
-        'salary_from', 'salary_to', 'salary_frequency', 'company_id',
-        'experience', 'employment'
-    ]
-    employers_column_names = [
-        'id', 'name', 'total_rating', 'reviews_count',
-        'accredited_it_employer', 'trusted', 'logo_url'
-    ]
-    vacancy_roles_column_names = [
-        'vacancy_id', 'role_id'
-    ]
-    vacancy_work_formats_column_names = [
-        'vacancy_id', 'work_format'
-    ]
-    vacancy_skills_column_names = [
-        "vacancy_id", "skill_id"
-    ]
         
     @task(task_id="fetch_currency_rates")
     def fetch_currency_rates():
         response = requests.get(f"https://api.currencyfreaks.com/v2.0/rates/latest?apikey={CURRENCY_TOKEN}")
         currency_values = response.json()["rates"]
 
-        output_file = makedir("raw", "currency_rates.json")
+        output_file = makefile("raw", "currency_rates.json")
 
         with open(output_file, "w") as f:
             json.dump(currency_values, f)
@@ -336,7 +335,7 @@ with DAG(
                     vacancy["employment"]["name"]
                 ])
         
-        output_file = makedir("raw", "vacancies.csv")
+        output_file = makefile("raw", "vacancies.csv")
 
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
@@ -379,7 +378,7 @@ with DAG(
 
         employers = [[key] + value for key, value in normalized.items()]
 
-        output_file = makedir("raw", "employers.csv")
+        output_file = makefile("raw", "employers.csv")
 
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
@@ -404,7 +403,7 @@ with DAG(
                     role_data["role_id"]
                 ])
         
-        output_file = makedir("raw", "vacancy_roles.csv")
+        output_file = makefile("raw", "vacancy_roles.csv")
         
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
@@ -429,7 +428,7 @@ with DAG(
                     for work_format in vacancy["work_format"]
                 ]
 
-        output_file = makedir("raw", "vacancy_work_formats.csv")
+        output_file = makefile("raw", "vacancy_work_formats.csv")
         
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
@@ -441,27 +440,21 @@ with DAG(
     @task(task_id="drop_invalid_salaries")
     def drop_invalid_salaries(**context):
         normalized_vacancies_csv = context["ti"].xcom_pull(task_ids="normalize_vacancies")
-
         vacancies_df = pd.read_csv(normalized_vacancies_csv)
         
-        print("[#] Обработка null значений с вакансии")
-        print("[#] До обработки")
-        print(f"[-] Общее количество записей: {vacancies_df['id'].count()}")
-        print("[-] Количество null значений в vacancies_df:")
         print(vacancies_df.isnull().sum())
         nulls_id = vacancies_df[
-            (vacancies_df['salary_from'].isnull() & vacancies_df['salary_to'].isnull())
+            (vacancies_df['salary_from'].isnull() | vacancies_df['salary_to'].isnull())
         ]["id"]
-        print("[-] Количество null значений с salary_from или " + \
-            f"salary_from & salary_to: {len(nulls_id.index)}")
-        print("[&] Удаляем вакансии с salary_from & salary_to == null...")
+        
         vacancies_df.drop(nulls_id.index, inplace=True)
-        print("[-] Количество null значений в vacancies_df:")
         print(vacancies_df.isnull().sum())
 
-        output_file = makedir("processed", "vacancies_without_invalid_salaries.csv")
+        output_file = makefile("processed", "vacancies.csv")
         vacancies_df.to_csv(output_file, index=False)
+        
         return output_file
+
 
     @task(task_id="fill_null_areas_and_generate_sql")
     def fill_null_areas(**context):
@@ -522,7 +515,7 @@ with DAG(
 
         vacancies_df.loc[:, ['latitude', 'longitude']] = vacancies_df["area"].apply(lambda x: coordinates[x]).values.tolist()
 
-        output_vacancies = makedir("processed", "vacancies_with_fixed_areas.csv")
+        output_vacancies = makefile("processed", "vacancies_with_fixed_areas.csv")
         
         vacancies_df.to_csv(output_vacancies, index=False)
         return {"vacancies_path": output_vacancies, "sql_path": output_sql}
@@ -552,7 +545,7 @@ with DAG(
             if i % 10 == 0:
                 print(i)
 
-        habr_skills_file = makedir("raw", "habr_skills.txt")
+        habr_skills_file = makefile("raw", "habr_skills.txt")
         
         with open(habr_skills_file, "w") as file:
             file.write("\n".join(parsed_skills))
@@ -582,7 +575,7 @@ with DAG(
             if page % 10 == 0:
                 print(f"{page} done")
 
-        getmatch_skills_file = makedir("raw", "getmatch_skills.txt")
+        getmatch_skills_file = makefile("raw", "getmatch_skills.txt")
         
         with open(getmatch_skills_file, "w") as file:
             file.write("\n".join(parsed_skills))
@@ -615,7 +608,7 @@ with DAG(
                 print(i, "Done")
             i += 1
 
-        requirements_json = makedir("raw", "vacancies_requirements.json")
+        requirements_json = makefile("raw", "vacancies_requirements.json")
 
         requirements_to_save = []
         for vacancy_id, requirement in requirements:
@@ -625,7 +618,7 @@ with DAG(
         with open(requirements_json, 'w') as file:
             json.dump(to_save, file)
 
-        hhru_skills_file = makedir("raw", "hhru_skills.txt")
+        hhru_skills_file = makefile("raw", "hhru_skills.txt")
         
         with open(hhru_skills_file) as file:
             file.write("\n".join(skills))
@@ -670,7 +663,7 @@ with DAG(
         insert_skills_sql = None
 
         if len(new_skills) != 0:
-            insert_skills_sql = makedir("processed", "insert_skills.sql")
+            insert_skills_sql = makefile("processed", "insert_skills.sql")
 
             with open(insert_skills_sql, "w") as file:
                 file.write("INSERT INTO skills (name) VALUES\n")
@@ -733,7 +726,7 @@ with DAG(
 
         vacancy_skills_df = pd.DataFrame(vacancy_skills, columns=vacancy_skills_column_names)
 
-        vacancy_skills_file = makedir("processed", "vacancy_skills.csv")
+        vacancy_skills_file = makefile("processed", "vacancy_skills.csv")
 
         vacancy_skills_df.to_csv(vacancy_skills_file, index=False)
 
