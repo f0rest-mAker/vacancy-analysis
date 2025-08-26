@@ -227,17 +227,14 @@ with DAG(
     schedule=None
 ) as dag:
     vacancies_column_names = [
-        'id', 'area', 'latitude', 'longitude', 'archived',
-        'created_at', 'published_at', 'has_test', 'internship',
-        'salary_from', 'salary_to', 'salary_frequency', 'company_id',
-        'experience', 'employment'
+        'id', 'employer_id', 'area', 'role_id', 'published_at',
+        'created_at',  'has_test', 'salary_from', 'salary_to',
+        'salary_currency', 'salary_frequency', 'experience',
+        'employment', 'has_test', 'is_internship'
     ]
     employers_column_names = [
         'id', 'name', 'total_rating', 'reviews_count',
         'accredited_it_employer', 'trusted', 'logo_url'
-    ]
-    vacancy_roles_column_names = [
-        'vacancy_id', 'role_id'
     ]
     vacancy_work_formats_column_names = [
         'vacancy_id', 'work_format'
@@ -282,6 +279,9 @@ with DAG(
         with open(output_file, 'w', encoding='utf-16') as file:
             json.dump(to_dump, file)
         
+        cursor.close()
+        connection.close()
+
         return output_file
 
         
@@ -313,31 +313,31 @@ with DAG(
             for vacancy in role_data["vacancies"]:
                 if not("id" in vacancy["employer"]): continue
                 
+                area = vacancy["area"]["name"]
+                if vacancy.get("address", []) and vacancy["address"].get("city", []):
+                    area = vacancy["address"]["city"]
+
                 salary_from = convert_with_checking(int, vacancy["salary_range"], "from")
                 salary_to = convert_with_checking(int, vacancy["salary_range"], "to")
 
                 if vacancy["salary_range"] and (currency := vacancy["salary_range"]["currency"]) != "RUR":
-                    if salary_from:
-                        salary_from = convert_to_RUB(salary_from, currency, currency_values)
-                    if salary_to:
-                        salary_to = convert_to_RUB(salary_to, currency, currency_values)
+                    if salary_from: salary_from = convert_to_RUB(salary_from, currency, currency_values)
+                    if salary_to: salary_to = convert_to_RUB(salary_to, currency, currency_values)
                 
                 normalized.append([
                     int(vacancy["id"]),
-                    vacancy["area"]["name"],
-                    convert_with_checking(float, vacancy["address"], "lat"),
-                    convert_with_checking(float, vacancy["address"], "lng"),
-                    vacancy["archived"],
-                    datetime.fromisoformat(vacancy["created_at"]),
+                    int(vacancy["employer"]["id"]),
+                    area,
+                    int(role_data["role_id"]),
                     datetime.fromisoformat(vacancy["published_at"]),
-                    vacancy["has_test"],
-                    vacancy["internship"],
+                    datetime.fromisoformat(vacancy["created_at"]),
                     salary_from,
                     salary_to,
                     vacancy["salary_range"]["frequency"]["name"].replace('\xa0', ' ') if vacancy["salary_range"] and vacancy["salary_range"]["frequency"] else "Неизвестно",
-                    int(vacancy["employer"]["id"]),
                     vacancy["experience"]["name"],
-                    vacancy["employment"]["name"]
+                    vacancy["employment"]["name"],
+                    vacancy["has_test"],
+                    vacancy["internship"]
                 ])
         
         output_file = makefile("raw", "vacancies.csv")
@@ -390,7 +390,7 @@ with DAG(
             csv_writer.writerows([employers_column_names] + employers)
 
         return output_file
-
+        
 
     @task(task_id="normalize_vacancy_work_formats")
     def normalize_vacancy_work_formats(**context):
@@ -552,14 +552,6 @@ with DAG(
         return output_vacancies
 
 
-    @task.branch(task_id="check_new_coordinates")
-    def check_new_coordinates(**context):
-        result = context["ti"].xcom_pull(task_ids="fill_null_areas_and_generate_sql", key="sql_path")
-        if result:
-            return "add_new_coordinates_to_db"
-        return "skip_add_coordinates"
-
-
     @task(task_id="parsing_skills_from_habr")
     def parsing_skills_from_habr():
         i = 1
@@ -616,7 +608,7 @@ with DAG(
 
     @task(task_id="extract_description_and_skills_from_hhru")
     def extract_description_and_skills_from_hhru(**context):
-        vacancies_path = context["ti"].xcom_pull(task_ids="fill_null_areas_and_generate_sql", key="vacancies_path")
+        vacancies_path = context["ti"].xcom_pull(task_ids="apply_vacancy_dim_ids")
         vacancies_df = pd.read_csv(vacancies_path)
         vacancy_ids = vacancies_df["id"].values
         requirements = []
@@ -675,7 +667,7 @@ with DAG(
             dbname=conn.schema
         )
         cursor = connection.cursor()
-        cursor.execute("select id, name from skills")
+        cursor.execute("select skill_id, skill_name from dim_skill")
         
         tech_skills = dict([(name, id) for id, name in cursor.fetchall()])
         skills = set(tech_skills.keys())
@@ -697,9 +689,12 @@ with DAG(
             insert_skills_sql = makefile("processed", "insert_skills.sql")
 
             with open(insert_skills_sql, "w") as file:
-                file.write("INSERT INTO skills (name) VALUES\n")
+                file.write("INSERT INTO dim_skill (skill_name) VALUES\n")
                 file.write(",\n".join([f"('{skill}')" for skill in parsed_skills.difference(skills)]) + ";")
         
+        cursor.close()
+        connection.close()
+
         return insert_skills_sql
 
 
@@ -711,12 +706,19 @@ with DAG(
         return "skip_add_skills"
 
 
+    @task.branch(task_id="check_new_areas")
+    def check_new_areas(**context):
+        result = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql", key="sql_path")
+        if result:
+            return "add_new_areas_to_db"
+        return "skip_add_coordinates"
+
+
     @task(task_id="get_skills_from_requirements")
     def get_skills_from_requirements():
         requirements_json = context["ti"].xcom_pull(task_ids="extract_description_and_skills_from_hhru", key="requirements")
 
         conn = BaseHook.get_connection("vacancy_db")
-
         connection = psycopg2.connect(
             host=conn.host,
             port=conn.port,
@@ -760,6 +762,9 @@ with DAG(
         vacancy_skills_file = makefile("processed", "vacancy_skills.csv")
 
         vacancy_skills_df.to_csv(vacancy_skills_file, index=False)
+
+        cursor.close()
+        connection.close()
 
         return vacancy_skills_file
 
