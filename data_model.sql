@@ -1,88 +1,85 @@
-create table employer (
-	id 						int primary key,
-	name 					varchar(40),
-	total_rating			numeric,
-	reviews_count			int,
-	accredited_it_employer 	boolean,
-	trusted 				boolean,
-	logo_url				text
+CREATE TABLE dim_employer (
+    employer_id INT PRIMARY KEY,
+    name VARCHAR(100),
+    total_rating NUMERIC NULL,
+    reviews_count INT NULL,
+    accredited_it_employer BOOLEAN,
+    trusted BOOLEAN,
+    logo_url TEXT
 );
 
-create table vacancy (
-	id 			  	 int primary key,
-	area 		  	 int,
-	latitude 	  	 numeric,
-	longitude 	  	 numeric,
-	archived 	  	 boolean,
-	created_at 	  	 timestamp,
-	published_at  	 timestamp,
-	has_test 	  	 boolean,
-	internship 	  	 boolean,
-	salary_from   	 int,
-	salary_to 	  	 int,
-	salary_frequency varchar(30),
-	salary_currency  varchar(5),
-	company_id 	  	 int,
-	experience 	  	 varchar(18),
-	employment	  	 varchar(20),
-	constraint vacancy_company_id_fk foreign key (company_id) references employer(id)
+CREATE TABLE staging_employer AS TABLE dim_employer WITH NO DATA;
+
+CREATE TABLE dim_role (
+    role_id INT PRIMARY KEY,
+    name VARCHAR(100)
 );
 
-create table roles (
-	id 	 int primary key,
-	name varchar(45)
+CREATE TABLE dim_area (
+    area_id SERIAL PRIMARY KEY,
+    area_name VARCHAR(100),
+    latitude NUMERIC,
+	longitude NUMERIC
 );
 
-create table vacancy_roles (
-	vacancy_id int,
-	role_id    int,
-	constraint vr_vacancy_id_fk foreign key (vacancy_id) references vacancy(id),
-	constraint vr_role_id_fk foreign key (role_id) references roles(id)
+CREATE TABLE dim_skill (
+    skill_id SERIAL PRIMARY KEY,
+    skill_name VARCHAR(100),
 );
 
-create table vacancy_work_formats (
-	vacancy_id int,
-	work_format varchar(20),
-	constraint vwf_vacancy_id_fk foreign key (vacancy_id) references vacancy(id)
+CREATE TABLE dim_work_format (
+    work_format_id SERIAL PRIMARY KEY,
+    format_name VARCHAR(50)
 );
 
-create table skills (
-	id 		 serial primary key,
-	name 	 varchar(50),
-	category varchar(25)
+CREATE TABLE dim_experience (
+    experience_id SERIAL PRIMARY KEY,
+    experience_name VARCHAR(18)
+)
+
+CREATE TABLE dim_employment (
+    employment_id SERIAL PRIMARY KEY,
+    employment_name VARCHAR(20)
+)
+
+CREATE TABLE dim_frequency (
+    frequency_id SERIAL PRIMARY KEY,
+    frequency_name VARCHAR(30)
+)
+
+CREATE TABLE fact_vacancy (
+    vacancy_id INT PRIMARY KEY,
+    employer_id INT REFERENCES dim_employer(employer_id),
+    area_id INT REFERENCES dim_area(area_id),
+    role_id INT REFERENCES dim_role(role_id),
+    published_date DATE,
+    created_date DATE,
+    salary_from INT NULL,
+    salary_to INT NULL,
+    salary_frequency_id INT REFERENCES dim_frequency(frequency_id),
+    experience_id INT REFERENCES dim_experience(experience_id),
+    employment_id INT REFERENCES dim_employment(employer_id),
+    has_test BOOLEAN,
+    is_internship BOOLEAN
 );
 
-create table vacancy_skills (
-	vacancy_id int,
-	skill_id   serial,
-	constraint vs_vacancy_id_fk foreign key (vacancy_id) references vacancy(id),
-	constraint vs_skill_id_fk foreign key (skill_id) references skills(id)
+CREATE TABLE vacancy_status_history (
+    history_id SERIAL PRIMARY KEY,
+    vacancy_id INT REFERENCES fact_vacancy(vacancy_id),
+    status BOOLEAN DEFAULT FALSE, -- archived or not
+    change_reason TEXT NULL,
+    valid_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP NULL,
+    valid_to TIMESTAMP NULL
 );
 
--- Какие профессии будем смотреть?
-insert into roles values
-(156, 'BI-аналитик, аналитик данных'),
-(160, 'DevOps-инженер'),
-(10, 'Аналитик'),
-(12, 'Арт-директор, креативный директор'),
-(150, 'Бизнес-аналитик'),
-(25, 'Гейм-дизайнер'),
-(165, 'Дата-сайентист'),
-(34, 'Дизайнер, художник'),
-(36, 'Директор по информационным технологиям (CIO)'),
-(73, 'Менеджер продукта'),
-(155, 'Методолог'),
-(96, 'Программист, разработчик'),
-(164, 'Продуктовый аналитик'),
-(104, 'Руководитель группы разработки'),
-(157, 'Руководитель отдела аналитики'),
-(107, 'Руководитель проектов'),
-(112, 'Сетевой инженер'),
-(113, 'Системный администратор'),
-(148, 'Системный аналитик'),
-(114, 'Системный инженер'),
-(116, 'Специалист по информационной безопасности'),
-(121, 'Специалист технической поддержки'),
-(124, 'Тестировщик'),
-(125, 'Технический директор (CTO)'),
-(126, 'Технический писатель');
+CREATE TABLE bridge_vacancy_skill (
+    vacancy_id INT REFERENCES fact_vacancy(vacancy_id),
+    skill_id INT REFERENCES dim_skill(skill_id),
+    PRIMARY KEY(vacancy_id, skill_id)
+);
+
+CREATE TABLE bridge_vacancy_work_format (
+	vacancy_id INT REFERENCES fact_vacancy(vacancy_id),
+	work_format_id INT REFERENCES dim_work_format(work_format_id),
+	PRIMARY KEY(vacancy_id, work_format_id)
+)

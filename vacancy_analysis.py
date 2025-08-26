@@ -214,6 +214,11 @@ def makefile(directory: str, filename: str) -> str:
     return output_file
 
 
+def make_dimention_dict(cursor, table: str, id_column: str, name_column: str) -> dict:
+    cursor.execute(f"SELECT {name_column}, {id_column} FROM {table}")
+    return {row[0]: row[1] for row in cursor.fetchall()}
+
+
 with DAG(
     "vacancy_analysis",
     default_args={
@@ -387,31 +392,6 @@ with DAG(
         return output_file
 
 
-    @task(task_id="normalize_vacancy_role")
-    def normalize_vacancy_role(**context):
-        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
-        with open(vacancies_json_path, "r", encoding="utf-16") as f:
-            data = json.load(f)
-        normalized = []
-
-        for role_data in data["items"]:
-            for vacancy in role_data["vacancies"]:
-                if not("id" in vacancy["employer"]): continue
-
-                normalized.append([
-                    int(vacancy["id"]),
-                    role_data["role_id"]
-                ])
-        
-        output_file = makefile("raw", "vacancy_roles.csv")
-        
-        with open(output_file, "w") as f:
-            csv_writer = csv.writer(f)
-            csv_writer.writerows([vacancy_roles_column_names] + normalized)
-
-        return output_file
-        
-
     @task(task_id="normalize_vacancy_work_formats")
     def normalize_vacancy_work_formats(**context):
         vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
@@ -456,8 +436,8 @@ with DAG(
         return output_file
 
 
-    @task(task_id="fill_null_areas_and_generate_sql")
-    def fill_null_areas(**context):
+    @task(task_id="look_areas_and_generate_sql")
+    def look_areas(**context):
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -469,56 +449,107 @@ with DAG(
         cursor = connection.cursor()
 
         vacancies_without_invalid_salaries = context["ti"].xcom_pull(task_ids="drop_invalid_salaries")
+        normalized_employers = context["ti"].xcom_pull(task_ids="normalize_employers")
+        
         vacancies_df = pd.read_csv(vacancies_without_invalid_salaries)
+        employers_df = pd.read_csv(normalized_employers)
+
         loc = Nominatim(user_agent="GetLoc")
-        areas_to_fix = vacancies_df[(vacancies_df['latitude'].isnull()) | (vacancies_df['longitude'].isnull())]["area"].unique()
+        areas_df = set(vacancies_df["area"].unique())
 
-        cursor.execute("SELECT name, latitude, longitude FROM area_coordinates")
+        cursor.execute("SELECT area_name FROM dim_area")
 
-        coordinates = {area[0]: [float(area[1]), float(area[2])] for area in cursor.fetchall()}
-        new_coordinates = {}
-        for area in areas_to_fix:
-            if area not in coordinates:
-                getLoc = loc.geocode(area)
+        areas_db = {area[0] for area in cursor.fetchall()}
+        missing_areas = areas_df.difference(areas_db)
+
+        output_sql = None
+        if missing_areas:
+            coordinates = {}
+            for missing_area in missing_areas:
+                getLoc = loc.geocode(missing_area)
                 if getLoc:
                     latitude = getLoc.latitude
                     longitude = getLoc.longitude
-                    coordinates[area] = [latitude, longitude]
-                    new_coordinates[area] = [latitude, longitude]
+                    coordinates[missing_area] = [latitude, longitude]
 
-        output_sql = None
-        if new_coordinates:
-            output_sql = os.path.join(DATA_PATH, "processed", "add_new_coordinates.sql")
-            os.makedirs(os.path.dirname(output_sql), exist_ok=True)
+            output_sql = makefile("processed", "add_new_areas.sql")
             with open(output_sql, "w") as file:
-                file.write("INSERT INTO area_coordinates (name, latitude, longitude) VALUES\n")
+                file.write("INSERT INTO dim_area (area_name, latitude, longitude) VALUES\n")
                 file.write(
                     ",\n".join(
                         [
                             f"('{name}', {latitude}, {longtitude})"
-                            for (name, (latitude, longtitude)) in new_coordinates.items()
+                            for (name, (latitude, longtitude)) in coordinates.items()
                         ]
                     ) + ";"
                 )
 
-        if len(coordinates.keys()) == len(areas_to_fix):
-            print("[&] Есть все координаты, меняем null...")
-        else:
-            print(f"[-] Количество ненайденных местностей: {len(areas_to_fix) - len(coordinates)}")
-            print("[-] Сбрасываем их.", end=" ")
-            null_areas = vacancies_df[
-                ~vacancies_df['area'].isin(coordinates.keys())
-            ]["id"].copy()
-            vacancies_df.drop(null_areas.index, inplace=True)
-            print(f"Количество сброшенных строк: {len(null_areas.index)}")
-            print("[&] Меняем null...")
+        output_vacancies = makefile("processed", "vacancies.csv")
+        dropping_index = vacancies_df[vacancies_df["area"].isin(missing_areas.difference(set(coordinates.keys())))].index
 
-        vacancies_df.loc[:, ['latitude', 'longitude']] = vacancies_df["area"].apply(lambda x: coordinates[x]).values.tolist()
+        vacancies_df.dropna(dropping_index, inplace=True)
 
-        output_vacancies = makefile("processed", "vacancies_with_fixed_areas.csv")
-        
+        employers_df = employers_df[employers_df["id"].isin(vacancies_df["employer_id"].unique())]
+        output_employers = makefile("processed", "necessary_employers.csv")
+
         vacancies_df.to_csv(output_vacancies, index=False)
-        return {"vacancies_path": output_vacancies, "sql_path": output_sql}
+        employers_df.to_csv(output_employers, index=False)
+
+        cursor.close()
+        connection.close()
+
+        return {
+            "vacancies_path": output_vacancies,
+            "sql_path": output_sql,
+            "employers_path": output_employers
+        }
+
+
+    @task(task_id="apply_vacancy_dim_ids")
+    def apply_vacancy_dim_ids(**context):
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+
+        dim_area = make_dimention_dict(cursor, "dim_area", "area_id", "area_name")
+        dim_experience = make_dimention_dict(cursor, "dim_experience", "experience_id", "experience_name")
+        dim_employment = make_dimention_dict(cursor, "dim_employment", "employment_id", "employment_name")
+        dim_frequency = make_dimention_dict(cursor, "dim_frequency", "frequency_id", "frequency_name")
+
+        vacancies_path = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql", key="vacancies_path")
+        vacancies_df = pd.read_csv(vacancies_path)
+
+        vacancies_df.loc[:, "area"] = vacancies_df["area"].apply(lambda x: dim_area[x])
+        vacancies_df.loc[:, "experience"] = vacancies_df["experience"].apply(lambda x: dim_experience[x])
+        vacancies_df.loc[:, "employment"] = vacancies_df["employment"].apply(lambda x: dim_employment[x])
+        vacancies_df.loc[:, "frequency"] = vacancies_df["frequency"].apply(lambda x: dim_frequency[x])
+
+        vacancies_df.rename(
+            columns={
+                "id": "vacancy_id",
+                "area": "area_id",
+                "experience": "experience_id",
+                "employment": "employment_id",
+                "frequency": "frequency_id"
+            },
+            inplace=True
+        )
+
+        output_vacancies = makefile("processed", "vacancies.csv")
+
+        vacancies_df.drop_duplicates(subset=["vacancy_id"], keep="first", inplace=True)
+        vacancies_df.to_csv(output_vacancies, index=False)
+
+        cursor.close()
+        connection.close()
+
+        return output_vacancies
 
 
     @task.branch(task_id="check_new_coordinates")
@@ -750,23 +781,14 @@ with DAG(
 
 
     # [Очистка null]
-    @task_group(group_id="clean")
-    def clean():
+    @task_group(group_id="processing")
+    def processing():
         drop_invalid_salaries_task = drop_invalid_salaries()
-        fill_null_areas_task = fill_null_areas()
-        check_new_coordinates_task = check_new_coordinates()
+        look_areas_task = look_areas()
+        apply_vacancy_dim_ids_task = apply_vacancy_dim_ids()
 
-        add_new_coordinates_to_db_task = SQLExecuteQueryOperator(
-            task_id="add_new_coordinates_to_db",
-            conn_id="vacancy_db",
-            sql="{{ ti.xcom_pull(task_id='fill_null_areas_and_generate_sql')['sql_path'] }}"
-        )
-
-        skip_add_coordinates = EmptyOperator(task_id="skip_add_coordinates")
-
-        drop_invalid_salaries_task >> fill_null_areas_task
-        fill_null_areas_task >> check_new_coordinates_task
-        check_new_coordinates_task >> [add_new_coordinates_to_db_task, skip_add_coordinates]
+        drop_invalid_salaries_task >> look_areas_task
+        look_areas_task >> apply_vacancy_dim_ids_task
 
 
     # [Парсинг скилов]
@@ -780,8 +802,6 @@ with DAG(
     # [Добавление скиллов]
     @task_group(group_id="update_reference")
     def update_reference():
-        union_parsed_skills_and_generate_sql_task = union_parsed_skills_and_generate_sql()
-
         check_new_skills_task = check_new_skills()
     
         skip_add_skills = EmptyOperator(task_id="skip_add_skills")
@@ -792,8 +812,18 @@ with DAG(
             sql="{{ ti.xcom_pull(task_id='union_parsed_skills_and_generate_sql') }}"
         )
 
-        union_parsed_skills_and_generate_sql_task >> check_new_skills_task
+        check_new_areas_task = check_new_areas()
+
+        add_new_areas_to_db_task = SQLExecuteQueryOperator(
+            task_id="add_new_areas_to_db",
+            conn_id="vacancy_db",
+            sql="{{ ti.xcom_pull(task_id='look_areas_and_generate_sql')['sql_path'] }}"
+        )
+
+        skip_add_coordinates = EmptyOperator(task_id="skip_add_coordinates")
+
         check_new_skills_task >> [add_new_skills_to_db_task, skip_add_skills]
+        check_new_areas_task >> [add_new_areas_to_db_task, skip_add_coordinates]
 
 
     # [Выделение скиллов из описаний]
@@ -805,7 +835,7 @@ with DAG(
     start = EmptyOperator(task_id="start")
     extract_group = extract()
     normalize_group = normalize()
-    clean_group = clean()
+    clean_group = processing()
     parsing_group = skills_parsing()
     update_group = update_reference()
     analyze_group = analyze()
