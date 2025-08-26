@@ -769,6 +769,121 @@ with DAG(
         return vacancy_skills_file
 
 
+    @task(task_id="load_employers")
+    def load_employers_to_staging(**context):
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+        cursor.execute("TRUNCATE TABLE staging_employer;")
+
+        employers_path = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql", key="employers_path")
+    
+        with open(employers_path, 'r') as file:
+            cursor.copy_expert(
+                "COPY staging_employer FROM STDIN WITH CSV HEADER", file
+            )
+
+        connection.commit()
+        cursor.close()
+        connection.close()
+
+
+    @task(task_id="load_vacancies_and_generate_sql")
+    def load_vacancies_and_generate_sql(**context):
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+
+        vacancies_path = context["ti"].xcom_pull(task_ids="apply_vacancy_dim_ids")
+
+        with open(vacancies_path, 'r') as file:
+            cursor.copy_expert(
+                "COPY fact_vacancy FROM STDIN WITH CSV HEADER", file
+            )
+        
+        vacancies_id = pd.read_csv(vacancies_path)["id"]
+
+        history_status_sql = makefile("processed", "insert_history_status_vacancies.sql")
+        with open(history_status_sql, "w") as file:
+            file.write("INSERT INTO vacancy_status_history (vacancy_id) VALUES\n")
+            file.write(",\n".join([f"({vacancy_id})" for vacancy_id in vacancies_id]))
+        
+        cursor.close()
+        connection.close()
+
+        return history_status_sql
+
+
+    @task(task_id="generate_vacancy_work_formats_sql")
+    def generate_vacancy_work_formats_sql(**context):
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+
+        vacancies_path = context["ti"].xcom_pull(task_id="apply_vacancy_dim_ids")
+        work_formats_path = context["ti"].xcom_pull(task_id="normalize_vacancy_work_formats")
+
+        vacancies_df = pd.read_csv(vacancies_path)
+        vacancy_work_formats_df = pd.read_csv(work_formats_path)
+        vacancy_work_formats_df = vacancy_work_formats_df[vacancy_work_formats_df["vacancy_id"].isin(vacancies_df["vacancy_id"])]
+
+        dim_work_format = make_dimention_dict(cursor, "dim_work_format", "work_format_id", "format_name")
+        vacancy_work_formats_df.loc[:, "work_format"] = work_formats_df.apply(lambda x: dim_work_format[x])
+        vacancy_work_formats_df.drop_duplicates(subset=["vacancy_id", "work_format"], keep="first", inplace=True)
+
+        output_sql = makefile("processed", "insert_vacancy_work_format.sql")
+        with open(output_sql, "w") as file:
+            file.write("INSERT INTO bridge_vacancy_work_format (vacancy_id, work_format_id) VALUES\n")
+            file.write(",\n".join([f"({row[0]}, {row[1]})" for row in vacancy_work_formats_df.values.tolist()]) + ";")
+
+        cursor.close()
+        connection.close()
+
+        return output_sql
+
+
+    @task(task_id="load_vacancy_skills")
+    def load_vacancy_skills(**context):
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+        
+        vacancy_skills_path = context["ti"].xcom_pull(task_id="get_skills_from_requirements")
+
+        with open(vacancy_skills_path, 'r') as file:
+            cursor.copy_expert(
+                "COPY bridge_vacancy_skill FROM STDIN WITH CSV HEADER", file
+            )
+
+        connection.commit()
+        cursor.close()
+        connection.close()
+
+
     # [Извлечение]
     @task_group(group_id="extract")
     def extract():
@@ -781,7 +896,6 @@ with DAG(
     def normalize():
         normalize_vacancies_task = normalize_vacancies()
         normalize_employers_task = normalize_employers()
-        normalize_vacancy_role_task = normalize_vacancy_role()
         normalize_vacancy_work_formats_task = normalize_vacancy_work_formats()
 
 
@@ -802,6 +916,9 @@ with DAG(
         parsing_skills_from_habr_task = parsing_skills_from_habr()
         parsing_skills_from_getmatch_task = parsing_skills_from_getmatch()
         extract_description_and_skills_from_hhru_task = extract_description_and_skills_from_hhru()
+        union_parsed_skills_and_generate_sql_task = union_parsed_skills_and_generate_sql()
+
+        [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task, extract_description_and_skills_from_hhru_task] >> union_parsed_skills_and_generate_sql_task
 
 
     # [Добавление скиллов]
@@ -836,15 +953,60 @@ with DAG(
     def analyze():
         get_skills_from_requirements_task = get_skills_from_requirements()
 
+
+    @task_group(group_id="load")
+    def load():
+        load_employers_to_staging_task = load_employers_to_staging()
+        upsert_employers = SQLExecuteQueryOperator(
+            task_id="upsert_employers",
+            conn_id="vacancy_db",
+            sql="""
+                MERGE INTO dim_employer AS target
+                USING staging_employer AS source
+                ON target.employer_id = source.employer_id
+                WHEN MATCHED THEN
+                UPDATE SET 
+                    name = source.name,
+                    total_rating = coalesce(source.total_rating, target.total_rating),
+                    reviews_count = coalesce(source.reviews_count, target.total_rating),
+                    accredited_it_employer = source.accredited_it_employer,
+                    trusted = source.trusted,
+                    logo_url = source.logo_url
+                WHEN NOT MATCHED THEN
+                INSERT (employer_id, name, total_rating, reviews_count, accredited_it_employer, trusted, logo_url)
+                VALUES (source.employer_id, source.name, source.total_rating, source.reviews_count, source.accredited_it_employer, source.trusted, source.logo_url);
+            """
+        )
+
+        load_vacancies_and_generate_sql_task = load_vacancies_and_generate_sql()
+        load_vacancy_history_status = SQLExecuteQueryOperator(
+            task_id="load_vacancy_history_status",
+            conn_id="vacancy_db",
+            sql="{{  ti.xcom_pull(task_id='load_vacancies_and_generate_sql') }}"
+        )
+    
+        generate_vacancy_work_formats_sql_task = generate_vacancy_work_formats_sql()
+        load_vacancy_work_formats = SQLExecuteQueryOperator(
+            task_id=" load_vacancy_work_formats",
+            conn_id="vacancy_db",
+            sql="{{ ti.xcom_pull(task_id='generate_vacancy_work_formats_sql') }}"
+        )
+
+        load_vacancy_skills_task = load_vacancy_skills()
+
+        load_employers_to_staging_task >> upsert_employers >> load_vacancies_and_generate_sql_task
+        load_vacancies_and_generate_sql_task >> load_vacancy_history_status >> generate_vacancy_work_formats_sql_task
+        generate_vacancy_work_formats_sql_task >> load_vacancy_work_formats >> load_vacancy_skills
+
     
     start = EmptyOperator(task_id="start")
     extract_group = extract()
     normalize_group = normalize()
-    clean_group = processing()
+    clean_group = clean()
     parsing_group = skills_parsing()
     update_group = update_reference()
     analyze_group = analyze()
+    load_group = load()
     end = EmptyOperator(task_id="end")
 
-    start >> extract_group >> normalize_group >> clean_group >> parsing_group >> update_group >> analyze_group >> end
-
+    start >> extract_group >> normalize_group >> clean_group >> parsing_group >> update_group >> analyze_group >> load_group >> end
