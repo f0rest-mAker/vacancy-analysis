@@ -12,6 +12,8 @@ import nltk
 import os
 import string
 
+from io import StringIO
+from sqlalchemy import create_engine
 from geopy.geocoders import Nominatim
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
@@ -29,28 +31,34 @@ from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 
+dag_path = os.path.abspath(__file__)
+dag_dir_path = os.path.dirname(dag_path)
+airflow_path = os.path.dirname(dag_dir_path)
+
 DATA_PATH = os.getenv(
     "AIRFLOW_VAR_DATA_PATH",
-    "/home/ruzal/Desktop/utils/airflow/data/vacancy-analysis"
+    f"{airflow_path}/data/vacancy-analysis"
 )
+RAW_PATH = os.path.join(DATA_PATH, "raw"); os.makedirs(RAW_PATH, exist_ok=True)
+PROCESSED_PATH = os.path.join(DATA_PATH, "processed"); os.makedirs(PROCESSED_PATH, exist_ok=True)
 CURRENCY_TOKEN = Variable.get("currency_token")
 
 
-def convert_with_checking(func: object, source: dict, target: str) -> None | object:
+def convert_with_checking(func: object, dict: dict, target: str) -> None | object:
     '''
-        Функция конертации с проверкой на наличие поля в source.
+        Функция конертации с проверкой на наличие поля в dict.
         
         Аргументы:
         - func: функция приведения к типу (`int`, `str`, `float` и т.д.).
-        - source: словарь, в котором нужно проверить на наличие поля.
+        - dict: словарь, в котором нужно проверить на наличие поля.
         - target: поле в словаре.
 
         Вывод:  
         Сконвертированное значение ключа поля или `None`.
     '''
 
-    if source:
-        value = source[target]
+    if dict:
+        value = dict[target]
         if value:
             return func(value)
         return None
@@ -197,23 +205,6 @@ def get_similar_skills(vacancies_id, text, model, skills_in_model, tech_skills, 
     return [(vacancies_id, tech_skills[skill]) for skill in found_skills]
 
 
-def makefile(directory: str, filename: str) -> str:
-    '''
-        Функция для создания недостающих катологов для файла.  
-
-        Аргументы:  
-        - directory: название папки, в которой будет находиться filename
-        - filename: название файла
-
-        Выход:  
-        Путь вида '{DATA_PATH}/directory/filename'
-    '''
-    output_dir = os.path.join(DATA_PATH, directory)
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, filename)
-    return output_file
-
-
 def make_dimention_dict(cursor, table: str, id_column: str, name_column: str) -> dict:
     cursor.execute(f"SELECT {name_column}, {id_column} FROM {table}")
     return {row[0]: row[1] for row in cursor.fetchall()}
@@ -229,7 +220,7 @@ with DAG(
     vacancies_column_names = [
         'id', 'employer_id', 'area', 'role_id', 'published_at',
         'created_at',  'has_test', 'salary_from', 'salary_to',
-        'salary_currency', 'salary_frequency', 'experience',
+        'salary_currency', 'experience',
         'employment', 'has_test', 'is_internship'
     ]
     employers_column_names = [
@@ -246,6 +237,7 @@ with DAG(
     @task(task_id="extract_vacancies_from_api")
     def extract_vacancies_from_api():
         conn = BaseHook.get_connection("vacancy_db")
+
         connection = psycopg2.connect(
             host=conn.host,
             port=conn.port,
@@ -256,7 +248,7 @@ with DAG(
         cursor = connection.cursor()
 
         cursor.execute("SELECT * FROM roles")
-        roles = dict([(row[0], row[1]) for row in cursor.fetchall()])
+        roles = {row[0]: row[1] for row in cursor.fetchall()}
         all_roles_id = roles.keys()
 
         all_vacancies = []
@@ -275,14 +267,12 @@ with DAG(
         
         to_dump = {"items": all_vacancies}
 
-        output_file = os.path.join(DATA_PATH, "extracted_vacancies.json")
-        with open(output_file, 'w', encoding='utf-16') as file:
+        output_json = os.path.join(RAW_PATH, "extracted_vacancies.json")
+        with open(output_json, 'w', encoding='utf-16') as file:
             json.dump(to_dump, file)
         
         cursor.close()
         connection.close()
-
-        return output_file
 
         
     @task(task_id="fetch_currency_rates")
@@ -290,18 +280,16 @@ with DAG(
         response = requests.get(f"https://api.currencyfreaks.com/v2.0/rates/latest?apikey={CURRENCY_TOKEN}")
         currency_values = response.json()["rates"]
 
-        output_file = makefile("raw", "currency_rates.json")
+        output_json = os.path.join(RAW_PATH, "currency_rates.json")
 
-        with open(output_file, "w") as f:
+        with open(output_json, "w") as f:
             json.dump(currency_values, f)
-
-        return output_file
 
     
     @task(task_id="normalize_vacancies")
-    def normalize_vacancies(**context):
-        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
-        currency_file = context["ti"].xcom_pull(task_ids="fetch_currency_rates")
+    def normalize_vacancies():
+        vacancies_json_path = os.path.join(RAW_PATH, "extracted_vacancies.json")
+        currency_file = os.path.join(RAW_PATH, "currency_rates.json")
         
         with open(currency_file, "r") as f:
             currency_values = json.load(f)
@@ -333,25 +321,22 @@ with DAG(
                     datetime.fromisoformat(vacancy["created_at"]),
                     salary_from,
                     salary_to,
-                    vacancy["salary_range"]["frequency"]["name"].replace('\xa0', ' ') if vacancy["salary_range"] and vacancy["salary_range"]["frequency"] else "Неизвестно",
                     vacancy["experience"]["name"],
                     vacancy["employment"]["name"],
                     vacancy["has_test"],
                     vacancy["internship"]
                 ])
         
-        output_file = makefile("raw", "vacancies.csv")
+        output_file = os.path.join(RAW_PATH, "vacancies.csv")
 
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
             csv_writer.writerows([vacancies_column_names] + normalized)
 
-        return output_file
-
 
     @task(task_id="normalize_employers")
-    def normalize_employers(**context):
-        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
+    def normalize_employers():
+        vacancies_json_path = os.path.join(RAW_PATH, "extracted_vacancies.json")
         with open(vacancies_json_path, "r", encoding="utf-16") as f:
             data = json.load(f)
         normalized = {}
@@ -383,18 +368,16 @@ with DAG(
 
         employers = [[key] + value for key, value in normalized.items()]
 
-        output_file = makefile("raw", "employers.csv")
+        output_file = os.path.join(RAW_PATH, "employers.csv")
 
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
             csv_writer.writerows([employers_column_names] + employers)
-
-        return output_file
         
 
     @task(task_id="normalize_vacancy_work_formats")
-    def normalize_vacancy_work_formats(**context):
-        vacancies_json_path = context["ti"].xcom_pull(task_ids="extract_vacancies_from_api")
+    def normalize_vacancy_work_formats():
+        vacancies_json_path = os.path.join(RAW_PATH, "extracted_vacancies.json")
         with open(vacancies_json_path, "r", encoding="utf-16") as f:
             data = json.load(f)
         normalized = []
@@ -408,32 +391,28 @@ with DAG(
                     for work_format in vacancy["work_format"]
                 ]
 
-        output_file = makefile("raw", "vacancy_work_formats.csv")
+        output_file = os.path.join(RAW_PATH, "vacancy_work_formats.csv")
         
         with open(output_file, "w") as f:
             csv_writer = csv.writer(f)
             csv_writer.writerows([vacancy_work_formats_column_names] + normalized)
 
-        return output_file
-
 
     @task(task_id="drop_invalid_salaries")
-    def drop_invalid_salaries(**context):
-        normalized_vacancies_csv = context["ti"].xcom_pull(task_ids="normalize_vacancies")
+    def drop_invalid_salaries():
+        normalized_vacancies_csv = os.path.join(RAW_PATH, "vacancies.csv")
         vacancies_df = pd.read_csv(normalized_vacancies_csv)
         
         print(vacancies_df.isnull().sum())
         nulls_id = vacancies_df[
-            (vacancies_df['salary_from'].isnull() | vacancies_df['salary_to'].isnull())
+            (vacancies_df['salary_from'].isnull() & vacancies_df['salary_to'].isnull())
         ]["id"]
         
         vacancies_df.drop(nulls_id.index, inplace=True)
         print(vacancies_df.isnull().sum())
 
-        output_file = makefile("processed", "vacancies.csv")
+        output_file = os.path.join(PROCESSED_PATH, "vacancies.csv")
         vacancies_df.to_csv(output_file, index=False)
-        
-        return output_file
 
 
     @task(task_id="look_areas_and_generate_sql")
@@ -448,10 +427,10 @@ with DAG(
         )
         cursor = connection.cursor()
 
-        vacancies_without_invalid_salaries = context["ti"].xcom_pull(task_ids="drop_invalid_salaries")
-        normalized_employers = context["ti"].xcom_pull(task_ids="normalize_employers")
+        vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
+        employers_path = os.path.join(RAW_PATH, "employers.csv")
         
-        vacancies_df = pd.read_csv(vacancies_without_invalid_salaries)
+        vacancies_df = pd.read_csv(vacancies_path)
         employers_df = pd.read_csv(normalized_employers)
 
         loc = Nominatim(user_agent="GetLoc")
@@ -462,7 +441,7 @@ with DAG(
         areas_db = {area[0] for area in cursor.fetchall()}
         missing_areas = areas_df.difference(areas_db)
 
-        output_sql = None
+        have_output_sql = False
         if missing_areas:
             coordinates = {}
             for missing_area in missing_areas:
@@ -472,7 +451,8 @@ with DAG(
                     longitude = getLoc.longitude
                     coordinates[missing_area] = [latitude, longitude]
 
-            output_sql = makefile("processed", "add_new_areas.sql")
+            have_output_sql = True
+            output_sql = os.path.join(PROCESSED_PATH, "add_new_areas.sql")
             with open(output_sql, "w") as file:
                 file.write("INSERT INTO dim_area (area_name, latitude, longitude) VALUES\n")
                 file.write(
@@ -484,29 +464,22 @@ with DAG(
                     ) + ";"
                 )
 
-        output_vacancies = makefile("processed", "vacancies.csv")
         dropping_index = vacancies_df[vacancies_df["area"].isin(missing_areas.difference(set(coordinates.keys())))].index
-
         vacancies_df.dropna(dropping_index, inplace=True)
 
         employers_df = employers_df[employers_df["id"].isin(vacancies_df["employer_id"].unique())]
-        output_employers = makefile("processed", "necessary_employers.csv")
+        output_employers = os.path.join(PROCESSED_PATH, "employers.csv")
 
-        vacancies_df.to_csv(output_vacancies, index=False)
+        vacancies_df.to_csv(vacancies_path, index=False)
         employers_df.to_csv(output_employers, index=False)
 
         cursor.close()
         connection.close()
 
-        return {
-            "vacancies_path": output_vacancies,
-            "sql_path": output_sql,
-            "employers_path": output_employers
-        }
-
+        return have_output_sql
 
     @task(task_id="apply_vacancy_dim_ids")
-    def apply_vacancy_dim_ids(**context):
+    def apply_vacancy_dim_ids():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -520,36 +493,29 @@ with DAG(
         dim_area = make_dimention_dict(cursor, "dim_area", "area_id", "area_name")
         dim_experience = make_dimention_dict(cursor, "dim_experience", "experience_id", "experience_name")
         dim_employment = make_dimention_dict(cursor, "dim_employment", "employment_id", "employment_name")
-        dim_frequency = make_dimention_dict(cursor, "dim_frequency", "frequency_id", "frequency_name")
 
-        vacancies_path = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql", key="vacancies_path")
+        vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
         vacancies_df = pd.read_csv(vacancies_path)
 
         vacancies_df.loc[:, "area"] = vacancies_df["area"].apply(lambda x: dim_area[x])
         vacancies_df.loc[:, "experience"] = vacancies_df["experience"].apply(lambda x: dim_experience[x])
         vacancies_df.loc[:, "employment"] = vacancies_df["employment"].apply(lambda x: dim_employment[x])
-        vacancies_df.loc[:, "frequency"] = vacancies_df["frequency"].apply(lambda x: dim_frequency[x])
 
         vacancies_df.rename(
             columns={
                 "id": "vacancy_id",
                 "area": "area_id",
                 "experience": "experience_id",
-                "employment": "employment_id",
-                "frequency": "frequency_id"
+                "employment": "employment_id"
             },
             inplace=True
         )
 
-        output_vacancies = makefile("processed", "vacancies.csv")
-
         vacancies_df.drop_duplicates(subset=["vacancy_id"], keep="first", inplace=True)
-        vacancies_df.to_csv(output_vacancies, index=False)
+        vacancies_df.to_csv(vacancies_path, index=False)
 
         cursor.close()
         connection.close()
-
-        return output_vacancies
 
 
     @task(task_id="parsing_skills_from_habr")
@@ -568,12 +534,10 @@ with DAG(
             if i % 10 == 0:
                 print(i)
 
-        habr_skills_file = makefile("raw", "habr_skills.txt")
+        habr_skills_file = os.path.join(RAW_PATH, "habr_skills.txt")
         
         with open(habr_skills_file, "w") as file:
             file.write("\n".join(parsed_skills))
-        
-        return habr_skills_file
 
 
     @task(task_id="parsing_skills_from_getmatch")
@@ -598,17 +562,15 @@ with DAG(
             if page % 10 == 0:
                 print(f"{page} done")
 
-        getmatch_skills_file = makefile("raw", "getmatch_skills.txt")
+        getmatch_skills_file = os.path.join(RAW_PATH, "getmatch_skills.txt")
         
         with open(getmatch_skills_file, "w") as file:
             file.write("\n".join(parsed_skills))
-        
-        return getmatch_skills_file
 
 
     @task(task_id="extract_description_and_skills_from_hhru")
-    def extract_description_and_skills_from_hhru(**context):
-        vacancies_path = context["ti"].xcom_pull(task_ids="apply_vacancy_dim_ids")
+    def extract_description_and_skills_from_hhru():
+        vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv") 
         vacancies_df = pd.read_csv(vacancies_path)
         vacancy_ids = vacancies_df["id"].values
         requirements = []
@@ -631,7 +593,7 @@ with DAG(
                 print(i, "Done")
             i += 1
 
-        requirements_json = makefile("raw", "vacancies_requirements.json")
+        requirements_json = os.path.join(RAW_PATH, "vacancies_requirements.json")
 
         requirements_to_save = []
         for vacancy_id, requirement in requirements:
@@ -641,22 +603,17 @@ with DAG(
         with open(requirements_json, 'w') as file:
             json.dump(to_save, file)
 
-        hhru_skills_file = makefile("raw", "hhru_skills.txt")
+        hhru_skills_file = os.path.join(RAW_PATH, "hhru_skills.txt")
         
         with open(hhru_skills_file) as file:
             file.write("\n".join(skills))
-        
-        return {
-            "requirements": requirements_json,
-            "skills": hhru_skills_file
-        }
 
 
     @task(task_id="union_parsed_skills_and_generate_sql")
     def union_parsed_skills_and_generate_sql(**context):
-        habr_file = context["ti"].xcom_pull(task_ids="parsing_skills_from_habr")
-        getmatch_file = context["ti"].xcom_pull(task_ids="parsing_skills_from_getmatch")
-        hhru_file = context["ti"].xcom_pull(task_ids="extract_description_and_skills_from_hhru", key="skills")
+        habr_file = os.path.join(RAW_PATH, "habr_skills.txt")
+        getmatch_file = os.path.join(RAW_PATH, "getmatch_skills.txt")
+        hhru_file = os.path.join(RAW_PATH, "hhru_skills.txt")
 
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
@@ -669,7 +626,7 @@ with DAG(
         cursor = connection.cursor()
         cursor.execute("select skill_id, skill_name from dim_skill")
         
-        tech_skills = dict([(name, id) for id, name in cursor.fetchall()])
+        tech_skills = {name: id for id, name in cursor.fetchall()}
         skills = set(tech_skills.keys())
         parsed_skills = set([])
         
@@ -683,10 +640,11 @@ with DAG(
         getmatch_file.close()
 
         new_skills = parsed_skills.difference(skills)
-        insert_skills_sql = None
+        insert_skills = False
 
         if len(new_skills) != 0:
-            insert_skills_sql = makefile("processed", "insert_skills.sql")
+            insert_skills = True
+            insert_skills_sql = os.path.join(PROCESSED_PATH, "insert_skills.sql")
 
             with open(insert_skills_sql, "w") as file:
                 file.write("INSERT INTO dim_skill (skill_name) VALUES\n")
@@ -695,8 +653,7 @@ with DAG(
         cursor.close()
         connection.close()
 
-        return insert_skills_sql
-
+        return insert_skills
 
     @task.branch(task_id="check_new_skills")
     def check_new_skills(**context):
@@ -716,7 +673,7 @@ with DAG(
 
     @task(task_id="get_skills_from_requirements")
     def get_skills_from_requirements():
-        requirements_json = context["ti"].xcom_pull(task_ids="extract_description_and_skills_from_hhru", key="requirements")
+        requirements_json = os.path.join(RAW_PATH, "vacancies_requirements.json")
 
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
@@ -759,18 +716,16 @@ with DAG(
 
         vacancy_skills_df = pd.DataFrame(vacancy_skills, columns=vacancy_skills_column_names)
 
-        vacancy_skills_file = makefile("processed", "vacancy_skills.csv")
+        vacancy_skills_file = os.path.join(PROCESSED_PATH, "vacancy_skills.csv")
 
         vacancy_skills_df.to_csv(vacancy_skills_file, index=False)
 
         cursor.close()
         connection.close()
 
-        return vacancy_skills_file
-
 
     @task(task_id="load_employers")
-    def load_employers_to_staging(**context):
+    def load_employers_to_staging():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -782,7 +737,7 @@ with DAG(
         cursor = connection.cursor()
         cursor.execute("TRUNCATE TABLE staging_employer;")
 
-        employers_path = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql", key="employers_path")
+        employers_path = os.path.join(PROCESSED_PATH, "employers.csv")
     
         with open(employers_path, 'r') as file:
             cursor.copy_expert(
@@ -795,7 +750,7 @@ with DAG(
 
 
     @task(task_id="load_vacancies_and_generate_sql")
-    def load_vacancies_and_generate_sql(**context):
+    def load_vacancies_and_generate_sql():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -806,7 +761,7 @@ with DAG(
         )
         cursor = connection.cursor()
 
-        vacancies_path = context["ti"].xcom_pull(task_ids="apply_vacancy_dim_ids")
+        vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
 
         with open(vacancies_path, 'r') as file:
             cursor.copy_expert(
@@ -815,7 +770,7 @@ with DAG(
         
         vacancies_id = pd.read_csv(vacancies_path)["id"]
 
-        history_status_sql = makefile("processed", "insert_history_status_vacancies.sql")
+        history_status_sql = os.path.join(PROCESSED_PATH, "insert_history_status_vacancies.sql")
         with open(history_status_sql, "w") as file:
             file.write("INSERT INTO vacancy_status_history (vacancy_id) VALUES\n")
             file.write(",\n".join([f"({vacancy_id})" for vacancy_id in vacancies_id]))
@@ -823,11 +778,9 @@ with DAG(
         cursor.close()
         connection.close()
 
-        return history_status_sql
 
-
-    @task(task_id="generate_vacancy_work_formats_sql")
-    def generate_vacancy_work_formats_sql(**context):
+    @task(task_id="load_vacancy_work_formats")
+    def generate_vacancy_work_formats_sql():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -838,8 +791,8 @@ with DAG(
         )
         cursor = connection.cursor()
 
-        vacancies_path = context["ti"].xcom_pull(task_id="apply_vacancy_dim_ids")
-        work_formats_path = context["ti"].xcom_pull(task_id="normalize_vacancy_work_formats")
+        vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
+        work_formats_path = cos.path.join(RAW_PATH, "extracted_vacancies.json")
 
         vacancies_df = pd.read_csv(vacancies_path)
         vacancy_work_formats_df = pd.read_csv(work_formats_path)
@@ -849,7 +802,7 @@ with DAG(
         vacancy_work_formats_df.loc[:, "work_format"] = work_formats_df.apply(lambda x: dim_work_format[x])
         vacancy_work_formats_df.drop_duplicates(subset=["vacancy_id", "work_format"], keep="first", inplace=True)
 
-        output_sql = makefile("processed", "insert_vacancy_work_format.sql")
+        output_sql = os.path.join(PROCESSED_PATH, "insert_vacancy_work_format.sql")
         with open(output_sql, "w") as file:
             file.write("INSERT INTO bridge_vacancy_work_format (vacancy_id, work_format_id) VALUES\n")
             file.write(",\n".join([f"({row[0]}, {row[1]})" for row in vacancy_work_formats_df.values.tolist()]) + ";")
@@ -857,11 +810,9 @@ with DAG(
         cursor.close()
         connection.close()
 
-        return output_sql
-
 
     @task(task_id="load_vacancy_skills")
-    def load_vacancy_skills(**context):
+    def load_vacancy_skills():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -872,7 +823,7 @@ with DAG(
         )
         cursor = connection.cursor()
         
-        vacancy_skills_path = context["ti"].xcom_pull(task_id="get_skills_from_requirements")
+        vacancy_skills_path = os.path.join(PROCESSED_PATH, "vacancy_skills.csv")
 
         with open(vacancy_skills_path, 'r') as file:
             cursor.copy_expert(
@@ -882,7 +833,6 @@ with DAG(
         connection.commit()
         cursor.close()
         connection.close()
-
 
     # [Извлечение]
     @task_group(group_id="extract")
@@ -931,7 +881,7 @@ with DAG(
         add_new_skills_to_db_task = SQLExecuteQueryOperator(
             task_id="add_new_skills_to_db",
             conn_id="vacancy_db",
-            sql="{{ ti.xcom_pull(task_id='union_parsed_skills_and_generate_sql') }}"
+            sql=os.path.join(PROCESSED_PATH, "insert_skills.sql")
         )
 
         check_new_areas_task = check_new_areas()
@@ -939,7 +889,7 @@ with DAG(
         add_new_areas_to_db_task = SQLExecuteQueryOperator(
             task_id="add_new_areas_to_db",
             conn_id="vacancy_db",
-            sql="{{ ti.xcom_pull(task_id='look_areas_and_generate_sql')['sql_path'] }}"
+            sql=os.path.join(PROCESSED_PATH, "add_new_areas.sql")
         )
 
         skip_add_coordinates = EmptyOperator(task_id="skip_add_coordinates")
@@ -982,31 +932,32 @@ with DAG(
         load_vacancy_history_status = SQLExecuteQueryOperator(
             task_id="load_vacancy_history_status",
             conn_id="vacancy_db",
-            sql="{{  ti.xcom_pull(task_id='load_vacancies_and_generate_sql') }}"
+            sql=os.path.join(PROCESSED_PATH, "insert_history_status_vacancies.sql")
         )
     
         generate_vacancy_work_formats_sql_task = generate_vacancy_work_formats_sql()
         load_vacancy_work_formats = SQLExecuteQueryOperator(
-            task_id=" load_vacancy_work_formats",
+            task_id="load_vacancy_work_formats",
             conn_id="vacancy_db",
-            sql="{{ ti.xcom_pull(task_id='generate_vacancy_work_formats_sql') }}"
+            sql=os.path.join(PROCESSED_PATH, "insert_vacancy_work_format.sql")
         )
 
         load_vacancy_skills_task = load_vacancy_skills()
 
         load_employers_to_staging_task >> upsert_employers >> load_vacancies_and_generate_sql_task
         load_vacancies_and_generate_sql_task >> load_vacancy_history_status >> generate_vacancy_work_formats_sql_task
-        generate_vacancy_work_formats_sql_task >> load_vacancy_work_formats >> load_vacancy_skills
+        generate_vacancy_work_formats_sql_task >> load_vacancy_work_formats >> load_vacancy_skills_task
 
-    
+
     start = EmptyOperator(task_id="start")
     extract_group = extract()
     normalize_group = normalize()
-    clean_group = clean()
+    processing_group = processing()
     parsing_group = skills_parsing()
     update_group = update_reference()
     analyze_group = analyze()
     load_group = load()
     end = EmptyOperator(task_id="end")
 
-    start >> extract_group >> normalize_group >> clean_group >> parsing_group >> update_group >> analyze_group >> load_group >> end
+    start >> extract_group >> normalize_group >> processing_group >> parsing_group >> update_group >> analyze_group >> load_group >> end
+
