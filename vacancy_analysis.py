@@ -431,7 +431,7 @@ with DAG(
         employers_path = os.path.join(RAW_PATH, "employers.csv")
         
         vacancies_df = pd.read_csv(vacancies_path)
-        employers_df = pd.read_csv(normalized_employers)
+        employers_df = pd.read_csv(employers_path)
 
         loc = Nominatim(user_agent="GetLoc")
         areas_df = set(vacancies_df["area"].unique())
@@ -477,6 +477,7 @@ with DAG(
         connection.close()
 
         return have_output_sql
+
 
     @task(task_id="apply_vacancy_dim_ids")
     def apply_vacancy_dim_ids():
@@ -749,8 +750,8 @@ with DAG(
         connection.close()
 
 
-    @task(task_id="load_vacancies_and_generate_sql")
-    def load_vacancies_and_generate_sql():
+    @task(task_id="load_vacancies_and_status_history")
+    def load_vacancies_and_status_history():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -768,27 +769,29 @@ with DAG(
                 "COPY fact_vacancy FROM STDIN WITH CSV HEADER", file
             )
         
-        vacancies_id = pd.read_csv(vacancies_path)["id"]
+        connection.commit()
 
-        history_status_sql = os.path.join(PROCESSED_PATH, "insert_history_status_vacancies.sql")
-        with open(history_status_sql, "w") as file:
-            file.write("INSERT INTO vacancy_status_history (vacancy_id) VALUES\n")
-            file.write(",\n".join([f"({vacancy_id})" for vacancy_id in vacancies_id]))
-        
-        cursor.close()
-        connection.close()
+        vacancies_id = pd.read_csv(vacancies_path)["id"]
+        buffer = StringIO()
+        vacancies_id.to_csv(buffer, index=False, header=False)
+        buffer.seek(0)
+        try:
+            copy_sql = f"COPY vacancy_status_history (vacancy_id) FROM STDIN WITH (FORMAT CSV)"
+            cursor.copy_expert(copy_sql, buffer)
+            connection.commit()
+        except (Exception, psycopg2.DatabaseError) as error:
+            connection.rollback()
+            print(f"Error during COPY vacancy_status_history: {error}")
+        finally:
+            cursor.close()
+            connection.close()
 
 
     @task(task_id="load_vacancy_work_formats")
-    def generate_vacancy_work_formats_sql():
+    def load_vacancy_work_formats():
         conn = BaseHook.get_connection("vacancy_db")
-        connection = psycopg2.connect(
-            host=conn.host,
-            port=conn.port,
-            user=conn.login,
-            password=conn.password,
-            dbname=conn.schema
-        )
+        engine = create_engine(f'postgresql+psycopg2://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}')
+        connection = engine.raw_connection()
         cursor = connection.cursor()
 
         vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
@@ -802,13 +805,19 @@ with DAG(
         vacancy_work_formats_df.loc[:, "work_format"] = work_formats_df.apply(lambda x: dim_work_format[x])
         vacancy_work_formats_df.drop_duplicates(subset=["vacancy_id", "work_format"], keep="first", inplace=True)
 
-        output_sql = os.path.join(PROCESSED_PATH, "insert_vacancy_work_format.sql")
-        with open(output_sql, "w") as file:
-            file.write("INSERT INTO bridge_vacancy_work_format (vacancy_id, work_format_id) VALUES\n")
-            file.write(",\n".join([f"({row[0]}, {row[1]})" for row in vacancy_work_formats_df.values.tolist()]) + ";")
+        output = StringIO()
+        vacancy_work_formats_df.to_csv(output, sep='\t', header=False, index=False, na_rep='')
+        output.seek(0)
 
-        cursor.close()
-        connection.close()
+        try:
+            cursor.copy_from(output, "bridge_vacancy_work_format", sep='\t', null='')
+            connection.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"Произошда ошибка: {e}")
+        finally:
+            cursor.close()
+            connection.close()
 
 
     @task(task_id="load_vacancy_skills")
@@ -928,25 +937,12 @@ with DAG(
             """
         )
 
-        load_vacancies_and_generate_sql_task = load_vacancies_and_generate_sql()
-        load_vacancy_history_status = SQLExecuteQueryOperator(
-            task_id="load_vacancy_history_status",
-            conn_id="vacancy_db",
-            sql=os.path.join(PROCESSED_PATH, "insert_history_status_vacancies.sql")
-        )
-    
-        generate_vacancy_work_formats_sql_task = generate_vacancy_work_formats_sql()
-        load_vacancy_work_formats = SQLExecuteQueryOperator(
-            task_id="load_vacancy_work_formats",
-            conn_id="vacancy_db",
-            sql=os.path.join(PROCESSED_PATH, "insert_vacancy_work_format.sql")
-        )
-
+        load_vacancies_and_status_history_task = load_vacancies_and_status_history()
+        load_vacancy_work_formats_task = load_vacancy_work_formats()
         load_vacancy_skills_task = load_vacancy_skills()
 
-        load_employers_to_staging_task >> upsert_employers >> load_vacancies_and_generate_sql_task
-        load_vacancies_and_generate_sql_task >> load_vacancy_history_status >> generate_vacancy_work_formats_sql_task
-        generate_vacancy_work_formats_sql_task >> load_vacancy_work_formats >> load_vacancy_skills_task
+        load_employers_to_staging_task >> upsert_employers >> load_vacancies_and_status_history_task
+        load_vacancies_and_status_history_task >> load_vacancy_work_formats_task >> load_vacancy_skills_task
 
 
     start = EmptyOperator(task_id="start")
