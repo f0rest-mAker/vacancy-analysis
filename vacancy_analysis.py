@@ -7,17 +7,10 @@ import pandas as pd
 import html
 import time
 import numpy as np
-import gensim.downloader as api
-import nltk
 import os
-import string
 
 from io import StringIO
 from sqlalchemy import create_engine
-from geopy.geocoders import Nominatim
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Tuple, Dict
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -32,7 +25,7 @@ from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 
 dag_path = os.path.abspath(__file__)
-dag_dir_path = os.path.dirname(dag_path)
+dag_dir_path = os.path.dirname(os.path.dirname(dag_path))
 airflow_path = os.path.dirname(dag_dir_path)
 
 DATA_PATH = os.getenv(
@@ -41,7 +34,6 @@ DATA_PATH = os.getenv(
 )
 RAW_PATH = os.path.join(DATA_PATH, "raw"); os.makedirs(RAW_PATH, exist_ok=True)
 PROCESSED_PATH = os.path.join(DATA_PATH, "processed"); os.makedirs(PROCESSED_PATH, exist_ok=True)
-CURRENCY_TOKEN = Variable.get("currency_token")
 
 
 def convert_with_checking(func: object, dict: dict, target: str) -> None | object:
@@ -78,7 +70,7 @@ def convert_to_RUB(value: int, from_currency: str, currency_values: dict) -> int
         1 валюта `from_currency` в рублях.
     """
 
-    RUB_value = float(currency_values["RUB"])
+    RUB_value = float(currency_values["rub"])
     from_currency_value = float(currency_values[from_currency])
     to_USD = value / from_currency_value
     return int(to_USD * RUB_value)
@@ -185,12 +177,22 @@ def extract_requirements_segment(html: str) -> str:
     return ' '.join(lines[5:30])
 
 
-def get_similar_skills(vacancies_id, text, model, skills_in_model, tech_skills, all_stop_words):
+def get_similar_skills(vacancies_id, 
+                       text,
+                       model,
+                       skills_in_model,
+                       tech_skills,
+                       all_stop_words,
+                       word_tokenize,
+                       cosine_similarity):
     lower_text = text.lower()
     
     tokens = [t for t in word_tokenize(lower_text) if t in model]
     
     tokens = [t for t in tokens if t.lower() not in all_stop_words and t.strip() != '']
+
+    if not tokens:
+        return []
 
     token_matrix = np.array([model[t] for t in tokens])
     skill_matrix = np.array([model[s.lower()] for s in skills_in_model])
@@ -215,13 +217,13 @@ with DAG(
     default_args={
         "owner": "airflow",
     },
-    schedule=None
+    schedule="@daily",
+    template_searchpath=[DATA_PATH]
 ) as dag:
     vacancies_column_names = [
         'id', 'employer_id', 'area', 'role_id', 'published_at',
-        'created_at',  'has_test', 'salary_from', 'salary_to',
-        'salary_currency', 'experience',
-        'employment', 'has_test', 'is_internship'
+        'created_at', 'salary_from', 'salary_to',
+        'experience', 'employment', 'has_test', 'is_internship'
     ]
     employers_column_names = [
         'id', 'name', 'total_rating', 'reviews_count',
@@ -246,8 +248,7 @@ with DAG(
             dbname=conn.schema
         )
         cursor = connection.cursor()
-
-        cursor.execute("SELECT * FROM roles")
+        cursor.execute("SELECT * FROM dim_role")
         roles = {row[0]: row[1] for row in cursor.fetchall()}
         all_roles_id = roles.keys()
 
@@ -277,8 +278,8 @@ with DAG(
         
     @task(task_id="fetch_currency_rates")
     def fetch_currency_rates():
-        response = requests.get(f"https://api.currencyfreaks.com/v2.0/rates/latest?apikey={CURRENCY_TOKEN}")
-        currency_values = response.json()["rates"]
+        response = requests.get(f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json")
+        currency_values = response.json()["usd"]
 
         output_json = os.path.join(RAW_PATH, "currency_rates.json")
 
@@ -302,13 +303,11 @@ with DAG(
                 if not("id" in vacancy["employer"]): continue
                 
                 area = vacancy["area"]["name"]
-                if vacancy.get("address", []) and vacancy["address"].get("city", []):
-                    area = vacancy["address"]["city"]
 
                 salary_from = convert_with_checking(int, vacancy["salary_range"], "from")
                 salary_to = convert_with_checking(int, vacancy["salary_range"], "to")
 
-                if vacancy["salary_range"] and (currency := vacancy["salary_range"]["currency"]) != "RUR":
+                if vacancy["salary_range"] and (currency := vacancy["salary_range"]["currency"].lower()) != "rur":
                     if salary_from: salary_from = convert_to_RUB(salary_from, currency, currency_values)
                     if salary_to: salary_to = convert_to_RUB(salary_to, currency, currency_values)
                 
@@ -417,6 +416,9 @@ with DAG(
 
     @task(task_id="look_areas_and_generate_sql")
     def look_areas(**context):
+        from geopy.geocoders import Nominatim
+
+
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -434,14 +436,14 @@ with DAG(
         employers_df = pd.read_csv(employers_path)
 
         loc = Nominatim(user_agent="GetLoc")
+        print("User agent loaded")
         areas_df = set(vacancies_df["area"].unique())
-
         cursor.execute("SELECT area_name FROM dim_area")
 
         areas_db = {area[0] for area in cursor.fetchall()}
         missing_areas = areas_df.difference(areas_db)
-
-        have_output_sql = False
+        print(f"missing_areas len: {len(missing_areas)}")
+        have_output_sql = None
         if missing_areas:
             coordinates = {}
             for missing_area in missing_areas:
@@ -464,8 +466,8 @@ with DAG(
                     ) + ";"
                 )
 
-        dropping_index = vacancies_df[vacancies_df["area"].isin(missing_areas.difference(set(coordinates.keys())))].index
-        vacancies_df.dropna(dropping_index, inplace=True)
+        dropping_index = vacancies_df[vacancies_df["area"].isin(missing_areas.difference(set(coordinates.keys())))]["id"].index
+        vacancies_df.drop(dropping_index, inplace=True)
 
         employers_df = employers_df[employers_df["id"].isin(vacancies_df["employer_id"].unique())]
         output_employers = os.path.join(PROCESSED_PATH, "employers.csv")
@@ -477,46 +479,6 @@ with DAG(
         connection.close()
 
         return have_output_sql
-
-
-    @task(task_id="apply_vacancy_dim_ids")
-    def apply_vacancy_dim_ids():
-        conn = BaseHook.get_connection("vacancy_db")
-        connection = psycopg2.connect(
-            host=conn.host,
-            port=conn.port,
-            user=conn.login,
-            password=conn.password,
-            dbname=conn.schema
-        )
-        cursor = connection.cursor()
-
-        dim_area = make_dimention_dict(cursor, "dim_area", "area_id", "area_name")
-        dim_experience = make_dimention_dict(cursor, "dim_experience", "experience_id", "experience_name")
-        dim_employment = make_dimention_dict(cursor, "dim_employment", "employment_id", "employment_name")
-
-        vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
-        vacancies_df = pd.read_csv(vacancies_path)
-
-        vacancies_df.loc[:, "area"] = vacancies_df["area"].apply(lambda x: dim_area[x])
-        vacancies_df.loc[:, "experience"] = vacancies_df["experience"].apply(lambda x: dim_experience[x])
-        vacancies_df.loc[:, "employment"] = vacancies_df["employment"].apply(lambda x: dim_employment[x])
-
-        vacancies_df.rename(
-            columns={
-                "id": "vacancy_id",
-                "area": "area_id",
-                "experience": "experience_id",
-                "employment": "employment_id"
-            },
-            inplace=True
-        )
-
-        vacancies_df.drop_duplicates(subset=["vacancy_id"], keep="first", inplace=True)
-        vacancies_df.to_csv(vacancies_path, index=False)
-
-        cursor.close()
-        connection.close()
 
 
     @task(task_id="parsing_skills_from_habr")
@@ -573,7 +535,7 @@ with DAG(
     def extract_description_and_skills_from_hhru():
         vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv") 
         vacancies_df = pd.read_csv(vacancies_path)
-        vacancy_ids = vacancies_df["id"].values
+        vacancy_ids = vacancies_df["id"].unique().tolist()
         requirements = []
         skills = set()
         i = 0
@@ -583,12 +545,12 @@ with DAG(
                 data = response.json()
                 segmented_description = extract_requirements_segment(data["description"]).lower()
                 for skill in data["key_skills"]:
-                    if len(skill) <= 45 and len(skill.split()) <= 3:
-                        skills.add(skill.lower())
+                    if len(skill["name"]) <= 45 and len(skill["name"].split()) <= 2:
+                        skills.add(skill["name"].lower())
                 requirements.append((vacancy_ids[i], segmented_description))
             elif response.status_code == 403:
-                print(f"Captcha at {i}'s request. Sleeping 10 seconds")
-                time.sleep(10)
+                print(f"Captcha at {i}'s request. Sleeping 30 seconds")
+                time.sleep(30)
                 continue
             if i % 100 == 0:
                 print(i, "Done")
@@ -606,7 +568,7 @@ with DAG(
 
         hhru_skills_file = os.path.join(RAW_PATH, "hhru_skills.txt")
         
-        with open(hhru_skills_file) as file:
+        with open(hhru_skills_file, 'w') as file:
             file.write("\n".join(skills))
 
 
@@ -641,7 +603,7 @@ with DAG(
         getmatch_file.close()
 
         new_skills = parsed_skills.difference(skills)
-        insert_skills = False
+        insert_skills = None
 
         if len(new_skills) != 0:
             insert_skills = True
@@ -666,14 +628,62 @@ with DAG(
 
     @task.branch(task_id="check_new_areas")
     def check_new_areas(**context):
-        result = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql", key="sql_path")
+        result = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql")
         if result:
             return "add_new_areas_to_db"
         return "skip_add_coordinates"
 
 
+    @task(task_id="apply_vacancy_dim_ids", trigger_rule="none_failed")
+    def apply_vacancy_dim_ids():
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+
+        dim_area = make_dimention_dict(cursor, "dim_area", "area_id", "area_name")
+        dim_experience = make_dimention_dict(cursor, "dim_experience", "experience_id", "experience_name")
+        dim_employment = make_dimention_dict(cursor, "dim_employment", "employment_id", "employment_name")
+
+        vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
+        vacancies_df = pd.read_csv(vacancies_path)
+
+        vacancies_df.loc[:, "area"] = vacancies_df["area"].apply(lambda x: dim_area[x])
+        vacancies_df.loc[:, "experience"] = vacancies_df["experience"].apply(lambda x: dim_experience[x])
+        vacancies_df.loc[:, "employment"] = vacancies_df["employment"].apply(lambda x: dim_employment[x])
+
+        vacancies_df.rename(
+            columns={
+                "id": "vacancy_id",
+                "area": "area_id",
+                "experience": "experience_id",
+                "employment": "employment_id"
+            },
+            inplace=True
+        )
+
+        vacancies_df.drop_duplicates(subset=["vacancy_id"], keep="first", inplace=True)
+        vacancies_df.to_csv(vacancies_path, index=False)
+
+        cursor.close()
+        connection.close()
+
+
+
     @task(task_id="get_skills_from_requirements")
     def get_skills_from_requirements():
+        import gensim.downloader as api
+        import string
+        from nltk.corpus import stopwords
+        from nltk.tokenize import word_tokenize
+        from sklearn.metrics.pairwise import cosine_similarity
+
+
         requirements_json = os.path.join(RAW_PATH, "vacancies_requirements.json")
 
         conn = BaseHook.get_connection("vacancy_db")
@@ -685,7 +695,7 @@ with DAG(
             dbname=conn.schema
         )
         cursor = connection.cursor()
-        cursor.execute("select id, name from skills")
+        cursor.execute("select skill_id, skill_name from dim_skill")
         
         tech_skills = dict([(name, id) for id, name in cursor.fetchall()])
 
@@ -712,7 +722,9 @@ with DAG(
                 model,
                 skills_in_model,
                 tech_skills,
-                all_stop_words
+                all_stop_words,
+                word_tokenize,
+                cosine_similarity
             )
 
         vacancy_skills_df = pd.DataFrame(vacancy_skills, columns=vacancy_skills_column_names)
@@ -763,7 +775,7 @@ with DAG(
         cursor = connection.cursor()
 
         vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
-
+        print(pd.read_csv(vacancies_path).info())
         with open(vacancies_path, 'r') as file:
             cursor.copy_expert(
                 "COPY fact_vacancy FROM STDIN WITH CSV HEADER", file
@@ -771,7 +783,7 @@ with DAG(
         
         connection.commit()
 
-        vacancies_id = pd.read_csv(vacancies_path)["id"]
+        vacancies_id = pd.read_csv(vacancies_path)["vacancy_id"]
         buffer = StringIO()
         vacancies_id.to_csv(buffer, index=False, header=False)
         buffer.seek(0)
@@ -795,14 +807,14 @@ with DAG(
         cursor = connection.cursor()
 
         vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
-        work_formats_path = cos.path.join(RAW_PATH, "extracted_vacancies.json")
+        work_formats_path = os.path.join(RAW_PATH, "vacancy_work_formats.csv")
 
         vacancies_df = pd.read_csv(vacancies_path)
         vacancy_work_formats_df = pd.read_csv(work_formats_path)
         vacancy_work_formats_df = vacancy_work_formats_df[vacancy_work_formats_df["vacancy_id"].isin(vacancies_df["vacancy_id"])]
 
         dim_work_format = make_dimention_dict(cursor, "dim_work_format", "work_format_id", "format_name")
-        vacancy_work_formats_df.loc[:, "work_format"] = work_formats_df.apply(lambda x: dim_work_format[x])
+        vacancy_work_formats_df.loc[:, "work_format"] = vacancy_work_formats_df["work_format"].apply(lambda x: dim_work_format[x])
         vacancy_work_formats_df.drop_duplicates(subset=["vacancy_id", "work_format"], keep="first", inplace=True)
 
         output = StringIO()
@@ -843,15 +855,16 @@ with DAG(
         cursor.close()
         connection.close()
 
+
     # [Извлечение]
-    @task_group(group_id="extract")
+    @task_group(group_id="extract", prefix_group_id=False)
     def extract():
         extract_vacancies_from_api_task = extract_vacancies_from_api()
         fetch_currency_rates_task = fetch_currency_rates()
 
 
     # [Нормализация]
-    @task_group(group_id="normalize")
+    @task_group(group_id="normalize", prefix_group_id=False)
     def normalize():
         normalize_vacancies_task = normalize_vacancies()
         normalize_employers_task = normalize_employers()
@@ -859,18 +872,16 @@ with DAG(
 
 
     # [Очистка null]
-    @task_group(group_id="processing")
+    @task_group(group_id="processing", prefix_group_id=False)
     def processing():
         drop_invalid_salaries_task = drop_invalid_salaries()
         look_areas_task = look_areas()
-        apply_vacancy_dim_ids_task = apply_vacancy_dim_ids()
 
         drop_invalid_salaries_task >> look_areas_task
-        look_areas_task >> apply_vacancy_dim_ids_task
 
 
     # [Парсинг скилов]
-    @task_group(group_id="skills_parsing")
+    @task_group(group_id="skills_parsing", prefix_group_id=False)
     def skills_parsing():
         parsing_skills_from_habr_task = parsing_skills_from_habr()
         parsing_skills_from_getmatch_task = parsing_skills_from_getmatch()
@@ -881,7 +892,7 @@ with DAG(
 
 
     # [Добавление скиллов]
-    @task_group(group_id="update_reference")
+    @task_group(group_id="update_reference", prefix_group_id=False)
     def update_reference():
         check_new_skills_task = check_new_skills()
     
@@ -890,7 +901,7 @@ with DAG(
         add_new_skills_to_db_task = SQLExecuteQueryOperator(
             task_id="add_new_skills_to_db",
             conn_id="vacancy_db",
-            sql=os.path.join(PROCESSED_PATH, "insert_skills.sql")
+            sql="processed/insert_skills.sql"
         )
 
         check_new_areas_task = check_new_areas()
@@ -898,7 +909,7 @@ with DAG(
         add_new_areas_to_db_task = SQLExecuteQueryOperator(
             task_id="add_new_areas_to_db",
             conn_id="vacancy_db",
-            sql=os.path.join(PROCESSED_PATH, "add_new_areas.sql")
+            sql="processed/add_new_areas.sql"
         )
 
         skip_add_coordinates = EmptyOperator(task_id="skip_add_coordinates")
@@ -908,33 +919,31 @@ with DAG(
 
 
     # [Выделение скиллов из описаний]
-    @task_group(group_id="analyze")
+    @task_group(group_id="analyze", prefix_group_id=False)
     def analyze():
+        apply_vacancy_dim_ids_task = apply_vacancy_dim_ids()
         get_skills_from_requirements_task = get_skills_from_requirements()
 
+        apply_vacancy_dim_ids_task >> get_skills_from_requirements_task
 
-    @task_group(group_id="load")
+
+    @task_group(group_id="load", prefix_group_id=False)
     def load():
         load_employers_to_staging_task = load_employers_to_staging()
         upsert_employers = SQLExecuteQueryOperator(
             task_id="upsert_employers",
             conn_id="vacancy_db",
             sql="""
-                MERGE INTO dim_employer AS target
-                USING staging_employer AS source
-                ON target.employer_id = source.employer_id
-                WHEN MATCHED THEN
-                UPDATE SET 
-                    name = source.name,
-                    total_rating = coalesce(source.total_rating, target.total_rating),
-                    reviews_count = coalesce(source.reviews_count, target.total_rating),
-                    accredited_it_employer = source.accredited_it_employer,
-                    trusted = source.trusted,
-                    logo_url = source.logo_url
-                WHEN NOT MATCHED THEN
-                INSERT (employer_id, name, total_rating, reviews_count, accredited_it_employer, trusted, logo_url)
-                VALUES (source.employer_id, source.name, source.total_rating, source.reviews_count, source.accredited_it_employer, source.trusted, source.logo_url);
-            """
+                INSERT INTO dim_employer
+                SELECT * FROM staging_employer
+                ON CONFLICT (employer_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    total_rating = coalesce(EXCLUDED.total_rating, dim_employer.total_rating),
+                    reviews_count = coalesce(EXCLUDED.reviews_count, dim_employer.total_rating),
+                    accredited_it_employer = EXCLUDED.accredited_it_employer,
+                    trusted = EXCLUDED.trusted,
+                    logo_url = EXCLUDED.logo_url
+                """
         )
 
         load_vacancies_and_status_history_task = load_vacancies_and_status_history()
@@ -942,7 +951,7 @@ with DAG(
         load_vacancy_skills_task = load_vacancy_skills()
 
         load_employers_to_staging_task >> upsert_employers >> load_vacancies_and_status_history_task
-        load_vacancies_and_status_history_task >> load_vacancy_work_formats_task >> load_vacancy_skills_task
+        load_vacancies_and_status_history_task >> [load_vacancy_work_formats_task, load_vacancy_skills_task]
 
 
     start = EmptyOperator(task_id="start")

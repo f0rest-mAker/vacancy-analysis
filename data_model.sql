@@ -24,7 +24,7 @@ CREATE TABLE dim_area (
 
 CREATE TABLE dim_skill (
     skill_id SERIAL PRIMARY KEY,
-    skill_name VARCHAR(100),
+    skill_name VARCHAR(100)
 );
 
 CREATE TABLE dim_work_format (
@@ -42,11 +42,6 @@ CREATE TABLE dim_employment (
     employment_name VARCHAR(20)
 )
 
-CREATE TABLE dim_frequency (
-    frequency_id SERIAL PRIMARY KEY,
-    frequency_name VARCHAR(30)
-)
-
 CREATE TABLE fact_vacancy (
     vacancy_id INT PRIMARY KEY,
     employer_id INT REFERENCES dim_employer(employer_id),
@@ -56,9 +51,8 @@ CREATE TABLE fact_vacancy (
     created_date DATE,
     salary_from INT NULL,
     salary_to INT NULL,
-    salary_frequency_id INT REFERENCES dim_frequency(frequency_id),
     experience_id INT REFERENCES dim_experience(experience_id),
-    employment_id INT REFERENCES dim_employment(employer_id),
+    employment_id INT REFERENCES dim_employment(employment_id),
     has_test BOOLEAN,
     is_internship BOOLEAN
 );
@@ -68,7 +62,7 @@ CREATE TABLE vacancy_status_history (
     vacancy_id INT REFERENCES fact_vacancy(vacancy_id),
     status BOOLEAN DEFAULT FALSE, -- archived or not
     change_reason TEXT NULL,
-    valid_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP NULL,
+    valid_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     valid_to TIMESTAMP NULL
 );
 
@@ -83,3 +77,22 @@ CREATE TABLE bridge_vacancy_work_format (
 	work_format_id INT REFERENCES dim_work_format(work_format_id),
 	PRIMARY KEY(vacancy_id, work_format_id)
 )
+
+insert into dim_work_format (format_name) values
+('На месте работодателя'),
+('Удалённо'),
+('Гибрид'),
+('Разъездной');
+
+insert into dim_experience (experience_name) values
+('Нет опыта'),
+('От 1 года до 3 лет'),
+('От 3 до 6 лет'),
+('Более 6 лет');
+
+insert into dim_employment (employment_name) values
+('Полная занятость'),
+('Частичная занятость'),
+('Проектная работа'),
+('Волонтерство'),
+('Стажировка');
