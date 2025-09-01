@@ -17,12 +17,10 @@ from bs4 import BeautifulSoup
 
 from airflow.sdk import DAG, task, task_group
 
-from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 
 from airflow.hooks.base import BaseHook
-from airflow.models import Variable
 
 dag_path = os.path.abspath(__file__)
 dag_dir_path = os.path.dirname(os.path.dirname(dag_path))
@@ -218,7 +216,8 @@ with DAG(
         "owner": "airflow",
     },
     schedule="@daily",
-    template_searchpath=[DATA_PATH]
+    template_searchpath=[DATA_PATH],
+    tags=["ETL", "analysis", "vacancy"]
 ) as dag:
     vacancies_column_names = [
         'id', 'employer_id', 'area', 'role_id', 'published_at',
@@ -531,22 +530,18 @@ with DAG(
             file.write("\n".join(parsed_skills))
 
 
-    @task(task_id="extract_description_and_skills_from_hhru")
-    def extract_description_and_skills_from_hhru():
+    @task(task_id="extract_requirements_from_hhru")
+    def extract_requirements_from_hhru():
         vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv") 
         vacancies_df = pd.read_csv(vacancies_path)
         vacancy_ids = vacancies_df["id"].unique().tolist()
         requirements = []
-        skills = set()
         i = 0
         while i != len(vacancy_ids):
             response = requests.get(f"https://api.hh.ru/vacancies/{vacancy_ids[i]}")
             if response.status_code == 200:
                 data = response.json()
                 segmented_description = extract_requirements_segment(data["description"]).lower()
-                for skill in data["key_skills"]:
-                    if len(skill["name"]) <= 45 and len(skill["name"].split()) <= 2:
-                        skills.add(skill["name"].lower())
                 requirements.append((vacancy_ids[i], segmented_description))
             elif response.status_code == 403:
                 print(f"Captcha at {i}'s request. Sleeping 30 seconds")
@@ -566,17 +561,11 @@ with DAG(
         with open(requirements_json, 'w') as file:
             json.dump(to_save, file)
 
-        hhru_skills_file = os.path.join(RAW_PATH, "hhru_skills.txt")
-        
-        with open(hhru_skills_file, 'w') as file:
-            file.write("\n".join(skills))
-
 
     @task(task_id="union_parsed_skills_and_generate_sql")
     def union_parsed_skills_and_generate_sql(**context):
         habr_file = os.path.join(RAW_PATH, "habr_skills.txt")
         getmatch_file = os.path.join(RAW_PATH, "getmatch_skills.txt")
-        hhru_file = os.path.join(RAW_PATH, "hhru_skills.txt")
 
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
@@ -674,15 +663,16 @@ with DAG(
         connection.close()
 
 
-
     @task(task_id="get_skills_from_requirements")
     def get_skills_from_requirements():
-        import gensim.downloader as api
         import string
+        from gensim.models import KeyedVectors
         from nltk.corpus import stopwords
         from nltk.tokenize import word_tokenize
         from sklearn.metrics.pairwise import cosine_similarity
 
+        models_dir = os.environ.get("GENSIM_DATA_DIR")
+        model_path = os.path.join(models_dir, "fasttext-wiki-news-subwords-300", "fasttext-wiki-news-subwords-300.gz")
 
         requirements_json = os.path.join(RAW_PATH, "vacancies_requirements.json")
 
@@ -703,7 +693,7 @@ with DAG(
             vacancy_requirements = json.loads(file.read())["items"]
 
         print("Model initialization")
-        model = api.load("fasttext-wiki-news-subwords-300")
+        model = KeyedVectors.load_word2vec_format(model_path)
         print("Model is ready")
 
         stop_words_en = set(stopwords.words('english'))
@@ -885,10 +875,9 @@ with DAG(
     def skills_parsing():
         parsing_skills_from_habr_task = parsing_skills_from_habr()
         parsing_skills_from_getmatch_task = parsing_skills_from_getmatch()
-        extract_description_and_skills_from_hhru_task = extract_description_and_skills_from_hhru()
         union_parsed_skills_and_generate_sql_task = union_parsed_skills_and_generate_sql()
 
-        [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task, extract_description_and_skills_from_hhru_task] >> union_parsed_skills_and_generate_sql_task
+        [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task] >> union_parsed_skills_and_generate_sql_task
 
 
     # [Добавление скиллов]
@@ -921,9 +910,11 @@ with DAG(
     # [Выделение скиллов из описаний]
     @task_group(group_id="analyze", prefix_group_id=False)
     def analyze():
+        extract_requirements_from_hhru_task = extract_requirements_from_hhru()
         apply_vacancy_dim_ids_task = apply_vacancy_dim_ids()
         get_skills_from_requirements_task = get_skills_from_requirements()
 
+        extract_requirements_from_hhru_task >> apply_vacancy_dim_ids_task
         apply_vacancy_dim_ids_task >> get_skills_from_requirements_task
 
 
