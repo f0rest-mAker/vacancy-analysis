@@ -16,11 +16,12 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 from airflow.sdk import DAG, task, task_group
-
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
-
 from airflow.hooks.base import BaseHook
+
+from vacancy_analysis.utils.processing_utils import normalize_text, replace_multiword_skills
+
 
 dag_path = os.path.abspath(__file__)
 dag_dir_path = os.path.dirname(os.path.dirname(dag_path))
@@ -32,7 +33,8 @@ DATA_PATH = os.getenv(
 )
 RAW_PATH = os.path.join(DATA_PATH, "raw"); os.makedirs(RAW_PATH, exist_ok=True)
 PROCESSED_PATH = os.path.join(DATA_PATH, "processed"); os.makedirs(PROCESSED_PATH, exist_ok=True)
-
+MODEL_PATH = os.path.join(DATA_PATH, "models"); os.makedirs(MODEL_PATH, exist_ok=True)
+MODEL_TRAIN_PATH = os.path.join(MODEL_PATH, "train"); os.makedirs(MODEL_TRAIN_PATH, exist_ok=True)
 
 def convert_with_checking(func: object, dict: dict, target: str) -> None | object:
     '''
@@ -175,34 +177,17 @@ def extract_requirements_segment(html: str) -> str:
     return ' '.join(lines[5:30])
 
 
-def get_similar_skills(vacancies_id, 
-                       text,
-                       model,
-                       skills_in_model,
-                       tech_skills,
-                       all_stop_words,
-                       word_tokenize,
-                       cosine_similarity):
-    lower_text = text.lower()
-    
-    tokens = [t for t in word_tokenize(lower_text) if t in model]
-    
-    tokens = [t for t in tokens if t.lower() not in all_stop_words and t.strip() != '']
+def find_skills(tokens, tree, skills_names, model, threshold=0.8):
+    found_skills = set()
+    for token in tokens:
+        if token in model.wv:
+            vec = model.wv[token].reshape(1, -1)
+            distances, indices = tree.query(vec, k=1)
+            similarity = 1 / (1 + distances[0][0])
+            if similarity > threshold:
+                found_skills.add(skills_names[indices[0][0]])
 
-    if not tokens:
-        return []
-
-    token_matrix = np.array([model[t] for t in tokens])
-    skill_matrix = np.array([model[s.lower()] for s in skills_in_model])
-
-    similarities = cosine_similarity(token_matrix, skill_matrix)
-
-    found_skills = {skills_in_model[j]
-                    for i in range(len(tokens))
-                    for j in range(len(skills_in_model))
-                    if similarities[i, j] > 0.85}
-    
-    return [(vacancies_id, tech_skills[skill]) for skill in found_skills]
+    return found_skills
 
 
 def make_dimention_dict(cursor, table: str, id_column: str, name_column: str) -> dict:
@@ -464,15 +449,15 @@ with DAG(
                         ]
                     ) + ";"
                 )
+            areas_to_drop = missing_areas.difference(set(coordinates.keys()))
+            dropping_index = vacancies_df[vacancies_df["area"].isin(areas_to_drop)]["id"].index
+            vacancies_df.drop(dropping_index, inplace=True)
 
-        dropping_index = vacancies_df[vacancies_df["area"].isin(missing_areas.difference(set(coordinates.keys())))]["id"].index
-        vacancies_df.drop(dropping_index, inplace=True)
+            employers_df = employers_df[employers_df["id"].isin(vacancies_df["employer_id"].unique())]
+            output_employers = os.path.join(PROCESSED_PATH, "employers.csv")
 
-        employers_df = employers_df[employers_df["id"].isin(vacancies_df["employer_id"].unique())]
-        output_employers = os.path.join(PROCESSED_PATH, "employers.csv")
-
-        vacancies_df.to_csv(vacancies_path, index=False)
-        employers_df.to_csv(output_employers, index=False)
+            vacancies_df.to_csv(vacancies_path, index=False)
+            employers_df.to_csv(output_employers, index=False)
 
         cursor.close()
         connection.close()
@@ -483,7 +468,7 @@ with DAG(
     @task(task_id="parsing_skills_from_habr")
     def parsing_skills_from_habr():
         i = 1
-        parsed_skills = set()
+        parsed_skills = {}
         while True:
             habr_response = requests.get(f"https://career.habr.com/vacancies?page={i}&s[]=22&s[]=17&s[]=18&s[]=183&s[]=19&s[]=187&s[]=20&s[]=89&s[]=108&s[]=129&s[]=130&s[]=51&s[]=52&s[]=53&s[]=102&s[]=103&s[]=104&s[]=120&s[]=121&s[]=113&s[]=132&s[]=131&s[]=179&s[]=49&s[]=45&s[]=46&s[]=50&s[]=47&s[]=48&s[]=101&s[]=112&s[]=44&s[]=125&s[]=177&s[]=175&s[]=126&s[]=78&s[]=21&s[]=172&s[]=174&s[]=79&s[]=173&s[]=80&s[]=176&s[]=81&s[]=118&s[]=182&s[]=32&s[]=33&s[]=34&s[]=119&s[]=185&s[]=36&s[]=186&s[]=37&s[]=110&s[]=94&s[]=23&s[]=24&s[]=30&s[]=25&s[]=27&s[]=26&s[]=90&s[]=28&s[]=91&s[]=92&s[]=29&s[]=93&s[]=122&s[]=31&s[]=109&s[]=98&s[]=41&s[]=42&s[]=43&s[]=168&s[]=99&s[]=76&s[]=96&s[]=97&s[]=95&s[]=100&s[]=133&s[]=111&s[]=12&s[]=10&s[]=13&s[]=87&s[]=11&s[]=14&s[]=15&s[]=16&s[]=107&s[]=2&s[]=3&s[]=4&s[]=82&s[]=72&s[]=5&s[]=75&s[]=6&s[]=1&s[]=77&s[]=7&s[]=83&s[]=84&s[]=73&s[]=8&s[]=85&s[]=86&s[]=188&s[]=178&s[]=106&type=all")
             soup = BeautifulSoup(habr_response.text, 'html.parser')
@@ -491,7 +476,8 @@ with DAG(
             if not tags:
                 break
             for tag in tags:
-                parsed_skills.add(tag.text.strip().lower())
+                skill = tag.text.strip().lower()
+                parsed_skills[skill] = parsed_skills.get(skill, 0) + 1
             i += 1
             if i % 10 == 0:
                 print(i)
@@ -499,7 +485,7 @@ with DAG(
         habr_skills_file = os.path.join(RAW_PATH, "habr_skills.txt")
         
         with open(habr_skills_file, "w") as file:
-            file.write("\n".join(parsed_skills))
+            file.write("\n".join([skill for skill in parsed_skills if parsed_skills[skill] > 7]))
 
 
     @task(task_id="parsing_skills_from_getmatch")
@@ -507,7 +493,7 @@ with DAG(
         response = requests.get("https://getmatch.ru/vacancies?p=1&sa=150000&pa=all&s=landing_ca_vacancies")
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        parsed_skills = set()
+        parsed_skills = {}
 
         pages = []
         for page_num in soup.find_all(class_='b-pagination-page ng-star-inserted'):
@@ -520,18 +506,81 @@ with DAG(
             for skill_tag in soup.select('div.b-vacancy-card-subtitle__stack span'):
                 lowered_tag = skill_tag.text.strip().lower()
                 for skill in get_proper_skill_getmatch(re.sub(r"\([\w\W]+\)", '', lowered_tag)):
-                    parsed_skills.add(skill.strip())
+                    parsed_skills[skill.strip()] = parsed_skills.get(skill.strip(), 0) + 1
             if page % 10 == 0:
                 print(f"{page} done")
 
         getmatch_skills_file = os.path.join(RAW_PATH, "getmatch_skills.txt")
         
         with open(getmatch_skills_file, "w") as file:
-            file.write("\n".join(parsed_skills))
+            file.write("\n".join([skill for skill in parsed_skills if parsed_skills[skill] > 7]))
 
 
-    @task(task_id="extract_requirements_from_hhru")
-    def extract_requirements_from_hhru():
+    @task(task_id="union_parsed_skills_and_generate_sql")
+    def union_parsed_skills_and_generate_sql(**context):
+        habr_file = os.path.join(RAW_PATH, "habr_skills.txt")
+        getmatch_file = os.path.join(RAW_PATH, "getmatch_skills.txt")
+
+        conn = BaseHook.get_connection("vacancy_db")
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+        cursor.execute("SELECT skill_name FROM dim_skill")
+        
+        skills_from_db = {name[0] for name in cursor.fetchall()}
+        parsed_skills = set()
+        
+        habr_file = open(habr_file, "r")
+        getmatch_file = open(getmatch_file, "r")
+
+        for skill in habr_file:
+            parsed_skills.add(skill.replace("\n", ""))
+        for skill in getmatch_file:
+            parsed_skills.add(skill.replace("\n", ""))
+
+        habr_file.close()
+        getmatch_file.close()
+
+        new_skills = parsed_skills - skills_from_db
+        insert_skills = None
+
+        if len(new_skills) != 0:
+            insert_skills = True
+            insert_skills_sql = os.path.join(PROCESSED_PATH, "insert_skills.sql")
+
+            with open(insert_skills_sql, "w") as file:
+                file.write("INSERT INTO dim_skill (skill_name) VALUES\n")
+                file.write(",\n".join([f"('{skill}')" for skill in new_skills]) + ";")
+        
+        cursor.close()
+        connection.close()
+
+        return insert_skills
+
+
+    @task.branch(task_id="check_new_skills")
+    def check_new_skills(**context):
+        insert_skills_sql = context["ti"].xcom_pull(task_ids="union_parsed_skills_and_generate_sql")
+        if insert_skills_sql:
+            return "add_new_skills_to_db"
+        return "skip_add_skills"
+
+
+    @task.branch(task_id="check_new_areas")
+    def check_new_areas(**context):
+        result = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql")
+        if result:
+            return "add_new_areas_to_db"
+        return "skip_add_coordinates"
+
+
+    @task(task_id="extract_requirements_from_hhru", trigger_rule="none_failed")
+    def extract_requirements_from_hhru(**context):
         vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv") 
         vacancies_df = pd.read_csv(vacancies_path)
         vacancy_ids = vacancies_df["id"].unique().tolist()
@@ -552,6 +601,7 @@ with DAG(
             i += 1
 
         requirements_json = os.path.join(RAW_PATH, "vacancies_requirements.json")
+        for_train_path = os.path.join(MODEL_TRAIN_PATH, f"requirements_{context['ds']}.json")
 
         requirements_to_save = []
         for vacancy_id, requirement in requirements:
@@ -560,70 +610,11 @@ with DAG(
 
         with open(requirements_json, 'w') as file:
             json.dump(to_save, file)
+        with open(for_train_path, "w") as train_file:
+            json.dump(to_save, train_file)
 
 
-    @task(task_id="union_parsed_skills_and_generate_sql")
-    def union_parsed_skills_and_generate_sql(**context):
-        habr_file = os.path.join(RAW_PATH, "habr_skills.txt")
-        getmatch_file = os.path.join(RAW_PATH, "getmatch_skills.txt")
-
-        conn = BaseHook.get_connection("vacancy_db")
-        connection = psycopg2.connect(
-            host=conn.host,
-            port=conn.port,
-            user=conn.login,
-            password=conn.password,
-            dbname=conn.schema
-        )
-        cursor = connection.cursor()
-        cursor.execute("select skill_id, skill_name from dim_skill")
-        
-        tech_skills = {name: id for id, name in cursor.fetchall()}
-        skills = set(tech_skills.keys())
-        parsed_skills = set([])
-        
-        habr_file = open(habr_file)
-        getmatch_file = open(getmatch_file)
-
-        parsed_skills = parsed_skills | set([skill for skill in habr_file])
-        parsed_skills = parsed_skills | set([skill for skill in getmatch_file])
-
-        habr_file.close()
-        getmatch_file.close()
-
-        new_skills = parsed_skills.difference(skills)
-        insert_skills = None
-
-        if len(new_skills) != 0:
-            insert_skills = True
-            insert_skills_sql = os.path.join(PROCESSED_PATH, "insert_skills.sql")
-
-            with open(insert_skills_sql, "w") as file:
-                file.write("INSERT INTO dim_skill (skill_name) VALUES\n")
-                file.write(",\n".join([f"('{skill}')" for skill in parsed_skills.difference(skills)]) + ";")
-        
-        cursor.close()
-        connection.close()
-
-        return insert_skills
-
-    @task.branch(task_id="check_new_skills")
-    def check_new_skills(**context):
-        insert_skills_sql = context["ti"].xcom_pull(task_ids="union_parsed_skills_and_generate_sql")
-        if insert_skills_sql:
-            return "add_new_skills_to_db"
-        return "skip_add_skills"
-
-
-    @task.branch(task_id="check_new_areas")
-    def check_new_areas(**context):
-        result = context["ti"].xcom_pull(task_ids="look_areas_and_generate_sql")
-        if result:
-            return "add_new_areas_to_db"
-        return "skip_add_coordinates"
-
-
-    @task(task_id="apply_vacancy_dim_ids", trigger_rule="none_failed")
+    @task(task_id="apply_vacancy_dim_ids")
     def apply_vacancy_dim_ids():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
@@ -666,14 +657,17 @@ with DAG(
     @task(task_id="get_skills_from_requirements")
     def get_skills_from_requirements():
         import string
-        from gensim.models import KeyedVectors
+        import numpy as np
+        from gensim.models import Word2Vec
         from nltk.corpus import stopwords
         from nltk.tokenize import word_tokenize
+        from pymorphy3 import MorphAnalyzer
         from sklearn.metrics.pairwise import cosine_similarity
+        from sklearn.neighbors import BallTree
 
-        models_dir = os.environ.get("GENSIM_DATA_DIR")
-        model_path = os.path.join(models_dir, "fasttext-wiki-news-subwords-300", "fasttext-wiki-news-subwords-300.gz")
 
+        model_path = os.path.join(MODEL_PATH, "skills.model")
+        morph = MorphAnalyzer()
         requirements_json = os.path.join(RAW_PATH, "vacancies_requirements.json")
 
         conn = BaseHook.get_connection("vacancy_db")
@@ -687,40 +681,42 @@ with DAG(
         cursor = connection.cursor()
         cursor.execute("select skill_id, skill_name from dim_skill")
         
-        tech_skills = dict([(name, id) for id, name in cursor.fetchall()])
+        skills_db = {name.replace(" ", "_"): id for id, name in cursor.fetchall()}
+        multiword_skills = [skill for skill in skills_db.keys() if "_" in skill]
 
         with open(requirements_json, 'r') as file:
             vacancy_requirements = json.loads(file.read())["items"]
 
         print("Model initialization")
-        model = KeyedVectors.load_word2vec_format(model_path)
+        model = Word2Vec.load(model_path)
         print("Model is ready")
 
         stop_words_en = set(stopwords.words('english'))
         stop_words_ru = set(stopwords.words('russian'))
         punctuation = set(string.punctuation)
-
-        skills_in_model = [s for s in tech_skills if s.lower() in model]
-
         all_stop_words = stop_words_en | stop_words_ru | punctuation
+
+        skills_vectors = []
+        skills_names = []
+        for skill in skills_db.keys():
+            if skill in model.wv:
+                skills_vectors.append(model.wv[skill])
+                skills_names.append(skill)
+
+        skills_matrix = np.array(skills_vectors)
+        tree = BallTree(skills_matrix, metric='euclidean')
 
         vacancy_skills = []
         for row in vacancy_requirements:
-            vacancy_skills += get_similar_skills(
-                row["vacancy_id"],
-                row["requirement"],
-                model,
-                skills_in_model,
-                tech_skills,
-                all_stop_words,
-                word_tokenize,
-                cosine_similarity
-            )
+            text_with_replacements = replace_multiword_skills(row["requirement"], multiword_skills)
+            tokens = normalize_text(text_with_replacements, word_tokenize, all_stop_words, morph)
+            extracted_skills = find_skills(tokens, tree, skills_names, model, 0.9)
+            vacancy_skills += [
+                [row["vacancy_id"], skills_db[skill]] for skill in extracted_skills
+            ]
 
         vacancy_skills_df = pd.DataFrame(vacancy_skills, columns=vacancy_skills_column_names)
-
         vacancy_skills_file = os.path.join(PROCESSED_PATH, "vacancy_skills.csv")
-
         vacancy_skills_df.to_csv(vacancy_skills_file, index=False)
 
         cursor.close()
