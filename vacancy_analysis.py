@@ -12,7 +12,7 @@ import os
 from io import StringIO
 from sqlalchemy import create_engine
 from typing import List, Tuple, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 
 from airflow.sdk import DAG, task, task_group
@@ -195,12 +195,32 @@ def make_dimention_dict(cursor, table: str, id_column: str, name_column: str) ->
     return {row[0]: row[1] for row in cursor.fetchall()}
 
 
+def get_employer_ratings(employer_name):
+    response = requests.get(f"https://dreamjob.ru/site/search-all?query={employer_name}")
+    soup = BeautifulSoup(response.text, 'html.parser')
+    cards = soup.select("[class='industry-card']")
+    for card in cards:
+        name = card.select(".industry-card__name-wrap div")[0].text.strip()
+        if name == employer_name:
+            rating_field = card.select(".sb-rating__value")[0].text.strip().split()
+            rating_fixed = rating_field[0].replace(',', '.')
+            rating = 0.0 if rating_fixed == "" else float(rating_fixed)
+            
+            reviews_count_field = card.select(".industry-card__review-link")[0].text.strip().split()
+            reviews_count_join = "".join([piece for piece in reviews_count_field if piece.isdigit()])
+            reviews_count = 0 if reviews_count_join == "" else int(reviews_count_join)
+
+            return [rating, reviews_count]
+    
+    return [None, None]
+
+
 with DAG(
     "vacancy_analysis",
     default_args={
         "owner": "airflow",
     },
-    schedule="@daily",
+    schedule="0 19 * * *",
     template_searchpath=[DATA_PATH],
     tags=["ETL", "analysis", "vacancy"]
 ) as dag:
@@ -221,7 +241,7 @@ with DAG(
     ]
 
     @task(task_id="extract_vacancies_from_api")
-    def extract_vacancies_from_api():
+    def extract_vacancies_from_api(**context):
         conn = BaseHook.get_connection("vacancy_db")
 
         connection = psycopg2.connect(
@@ -235,19 +255,26 @@ with DAG(
         cursor.execute("SELECT * FROM dim_role")
         roles = {row[0]: row[1] for row in cursor.fetchall()}
         all_roles_id = roles.keys()
+        start_extracting_date = context["logical_date"] - timedelta(days=1)
+        start_extracting_date = start_extracting_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_extracting_date = start_extracting_date + timedelta(days=1) - timedelta(minutes=5)
+
+        start_extracting_date = start_extracting_date.strftime("%Y-%m-%dT%H:%M:%S")
+        end_extracting_date = end_extracting_date.strftime("%Y-%m-%dT%H:%M:%S")
 
         all_vacancies = []
         for id in all_roles_id:
             vacancies = []
             i = 0
-            response = requests.get(f"https://api.hh.ru/vacancies?area=113&per_page=100&page={i}&order_by=publication_time&ored_clusters=true&professional_role={id}&period=1")
+            response = requests.get(f"https://api.hh.ru/vacancies?area=113&per_page=100&page={i}&order_by=publication_time&ored_clusters=true&professional_role={id}&date_from={start_extracting_date}&date_to={end_extracting_date}")
             response_data = response.json()
             print(f"{roles[id]}: {response.status_code}, {response.reason}, {response_data['found']}")
             vacancies += response_data["items"]
             if to := response_data["found"] // 100:
                 for i in range(1, to + 1):
-                    response = requests.get(f"https://api.hh.ru/vacancies?area=113&per_page=100&page={i}&order_by=publication_time&ored_clusters=true&professional_role={id}&period=1").json()
-                    vacancies += response["items"]
+                    response = requests.get(f"https://api.hh.ru/vacancies?area=113&per_page=100&page={i}&order_by=publication_time&ored_clusters=true&professional_role={id}&date_from={start_extracting_date}&date_to={end_extracting_date}").json()
+                    if response.get("items", []):
+                        vacancies += response["items"]
             all_vacancies.append({"role_id": id, "vacancies": vacancies})
         
         to_dump = {"items": all_vacancies}
@@ -330,7 +357,7 @@ with DAG(
 
                 employer = normalized.get(vacancy["employer"]["id"], [])
                 if not employer:
-                    normalized[int(vacancy["employer"]["id"])] = [
+                    normalized[vacancy["employer"]["id"]] = [
                         vacancy["employer"]["name"],
                         None if not("employer_rating" in vacancy["employer"]) else convert_with_checking(float, vacancy["employer"]["employer_rating"], "total_rating"),
                         None if not("employer_rating" in vacancy["employer"]) else convert_with_checking(int, vacancy["employer"]["employer_rating"], "reviews_count"),
@@ -349,7 +376,7 @@ with DAG(
                     if not employer[5] and log_url:
                         employer[5] = log_url
 
-        employers = [[key] + value for key, value in normalized.items()]
+        employers = [[int(key)] + value for key, value in normalized.items()]
 
         output_file = os.path.join(RAW_PATH, "employers.csv")
 
@@ -419,7 +446,7 @@ with DAG(
         vacancies_df = pd.read_csv(vacancies_path)
         employers_df = pd.read_csv(employers_path)
 
-        loc = Nominatim(user_agent="GetLoc")
+        loc = Nominatim(user_agent="GetLoc", timeout=10)
         print("User agent loaded")
         areas_df = set(vacancies_df["area"].unique())
         cursor.execute("SELECT area_name FROM dim_area")
@@ -436,33 +463,50 @@ with DAG(
                     latitude = getLoc.latitude
                     longitude = getLoc.longitude
                     coordinates[missing_area] = [latitude, longitude]
+                time.sleep(1)
 
             have_output_sql = True
             output_sql = os.path.join(PROCESSED_PATH, "add_new_areas.sql")
+            coordinate_names = list(coordinates.keys())
             with open(output_sql, "w") as file:
-                file.write("INSERT INTO dim_area (area_name, latitude, longitude) VALUES\n")
-                file.write(
-                    ",\n".join(
-                        [
-                            f"('{name}', {latitude}, {longtitude})"
-                            for (name, (latitude, longtitude)) in coordinates.items()
-                        ]
-                    ) + ";"
-                )
+                for i in range(0, len(coordinates), 10):
+                    batch_coordinates = coordinate_names[i:i+10]
+                    if batch_coordinates:
+                        file.write("INSERT INTO dim_area (area_name, latitude, longitude) VALUES\n")
+                        file.write(
+                            ",\n".join(
+                                [
+                                    f"('{name}', {coordinates[name][0]}, {coordinates[name][0]})"
+                                    for name in batch_coordinates
+                                ]
+                            ) + ";\n"
+                        )
             areas_to_drop = missing_areas.difference(set(coordinates.keys()))
             dropping_index = vacancies_df[vacancies_df["area"].isin(areas_to_drop)]["id"].index
             vacancies_df.drop(dropping_index, inplace=True)
 
-            employers_df = employers_df[employers_df["id"].isin(vacancies_df["employer_id"].unique())]
-            output_employers = os.path.join(PROCESSED_PATH, "employers.csv")
+        employers_df = employers_df[employers_df["id"].isin(list(vacancies_df["employer_id"].unique()))]
+        output_employers = os.path.join(PROCESSED_PATH, "employers.csv")
 
-            vacancies_df.to_csv(vacancies_path, index=False)
-            employers_df.to_csv(output_employers, index=False)
+        vacancies_df.to_csv(vacancies_path, index=False)
+        employers_df.to_csv(output_employers, index=False)
 
         cursor.close()
         connection.close()
 
         return have_output_sql
+
+
+    @task(task_id="parsing_employer_reviews")
+    def parsing_employer_reviews():
+        employers_path = os.path.join(PROCESSED_PATH, "employers.csv")
+        employers_df = pd.read_csv(employers_path)
+
+        employers_df['total_rating'], employers_df['reviews_count'] = zip(
+            *employers_df['name'].apply(get_employer_ratings)
+        )
+
+        employers_df.to_csv(employers_path)
 
 
     @task(task_id="parsing_skills_from_habr")
@@ -867,12 +911,14 @@ with DAG(
 
 
     # [Парсинг скилов]
-    @task_group(group_id="skills_parsing", prefix_group_id=False)
+    @task_group(group_id="parsing", prefix_group_id=False)
     def skills_parsing():
+        parsing_employer_reviews_task = parsing_employer_reviews()
         parsing_skills_from_habr_task = parsing_skills_from_habr()
         parsing_skills_from_getmatch_task = parsing_skills_from_getmatch()
         union_parsed_skills_and_generate_sql_task = union_parsed_skills_and_generate_sql()
 
+        parsing_employer_reviews_task >> [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task]
         [parsing_skills_from_habr_task, parsing_skills_from_getmatch_task] >> union_parsed_skills_and_generate_sql_task
 
 
