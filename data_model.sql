@@ -1,3 +1,5 @@
+-- Tables
+
 CREATE TABLE dim_employer (
     employer_id INT PRIMARY KEY,
     name VARCHAR(100),
@@ -35,12 +37,12 @@ CREATE TABLE dim_work_format (
 CREATE TABLE dim_experience (
     experience_id SERIAL PRIMARY KEY,
     experience_name VARCHAR(18)
-)
+);
 
 CREATE TABLE dim_employment (
     employment_id SERIAL PRIMARY KEY,
     employment_name VARCHAR(20)
-)
+);
 
 CREATE TABLE fact_vacancy (
     vacancy_id INT PRIMARY KEY,
@@ -57,6 +59,8 @@ CREATE TABLE fact_vacancy (
     is_internship BOOLEAN
 );
 
+CREATE TABLE staging_vacancy AS TABLE fact_vacancy WITH no data;
+
 CREATE TABLE vacancy_status_history (
     history_id SERIAL PRIMARY KEY,
     vacancy_id INT REFERENCES fact_vacancy(vacancy_id),
@@ -72,32 +76,36 @@ CREATE TABLE bridge_vacancy_skill (
     PRIMARY KEY(vacancy_id, skill_id)
 );
 
+CREATE TABLE staging_vacancy_skill AS TABLE bridge_vacancy_skill WITH no data;
+
 CREATE TABLE bridge_vacancy_work_format (
 	vacancy_id INT REFERENCES fact_vacancy(vacancy_id),
 	work_format_id INT REFERENCES dim_work_format(work_format_id),
 	PRIMARY KEY(vacancy_id, work_format_id)
-)
+);
 
-insert into dim_work_format (format_name) values
+CREATE TABLE staging_vacancy_work_format AS TABLE bridge_vacancy_work_format WITH no data;
+
+INSERT INTO dim_work_format (format_name) VALUES
 ('На месте работодателя'),
 ('Удалённо'),
 ('Гибрид'),
 ('Разъездной');
 
-insert into dim_experience (experience_name) values
+INSERT INTO dim_experience (experience_name) VALUES
 ('Нет опыта'),
 ('От 1 года до 3 лет'),
 ('От 3 до 6 лет'),
 ('Более 6 лет');
 
-insert into dim_employment (employment_name) values
+INSERT INTO dim_employment (employment_name) VALUES
 ('Полная занятость'),
 ('Частичная занятость'),
 ('Проектная работа'),
 ('Волонтерство'),
 ('Стажировка');
 
-insert into dim_role (role_id, name) values
+INSERT INTO dim_role (role_id, name) VALUES
 (156,'BI-аналитик, аналитик данных'),
 (160,'DevOps-инженер'),
 (10,'Аналитик'),
@@ -123,3 +131,41 @@ insert into dim_role (role_id, name) values
 (124,'Тестировщик'),
 (125,'Технический директор (CTO)'),
 (126,'Технический писатель');
+
+-- Functions and triggers
+
+CREATE OR REPLACE FUNCTION log_vacancy_creation()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO vacancy_status_history (vacancy_id, valid_from)
+    VALUES (NEW.vacancy_id, NEW.published_date);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_log_vacancy_creation
+AFTER INSERT ON fact_vacancy
+FOR EACH ROW
+EXECUTE FUNCTION log_vacancy_creation();
+
+
+CREATE OR REPLACE FUNCTION log_vacancy_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE vacancy_status_history
+    SET valid_to = NEW.published_date
+    WHERE vacancy_id = NEW.vacancy_id AND valid_to IS NULL;
+
+    INSERT INTO vacancy_status_history (vacancy_id, change_reason, valid_from)
+    VALUES (NEW.vacancy_id, 'reuploaded', NEW.published_date);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_log_vacancy_update
+AFTER UPDATE ON fact_vacancy
+FOR EACH ROW
+EXECUTE FUNCTION log_vacancy_update();
+

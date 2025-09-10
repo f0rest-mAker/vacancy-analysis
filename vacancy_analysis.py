@@ -196,7 +196,12 @@ def make_dimention_dict(cursor, table: str, id_column: str, name_column: str) ->
 
 
 def get_employer_ratings(employer_name):
-    response = requests.get(f"https://dreamjob.ru/site/search-all?query={employer_name}")
+    headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/123.0 Safari/537.36"
+    }
+    response = requests.get(f"https://dreamjob.ru/site/search-all?query={employer_name}", headers=headers, timeout=60)
     soup = BeautifulSoup(response.text, 'html.parser')
     cards = soup.select("[class='industry-card']")
     for card in cards:
@@ -212,7 +217,7 @@ def get_employer_ratings(employer_name):
 
             return [rating, reviews_count]
     
-    return [None, None]
+    return [0.0, 0]
 
 
 with DAG(
@@ -446,7 +451,7 @@ with DAG(
         vacancies_df = pd.read_csv(vacancies_path)
         employers_df = pd.read_csv(employers_path)
 
-        loc = Nominatim(user_agent="GetLoc", timeout=10)
+        loc = Nominatim(user_agent="GetLoc", timeout=30)
         print("User agent loaded")
         areas_df = set(vacancies_df["area"].unique())
         cursor.execute("SELECT area_name FROM dim_area")
@@ -469,18 +474,15 @@ with DAG(
             output_sql = os.path.join(PROCESSED_PATH, "add_new_areas.sql")
             coordinate_names = list(coordinates.keys())
             with open(output_sql, "w") as file:
-                for i in range(0, len(coordinates), 10):
-                    batch_coordinates = coordinate_names[i:i+10]
-                    if batch_coordinates:
-                        file.write("INSERT INTO dim_area (area_name, latitude, longitude) VALUES\n")
-                        file.write(
-                            ",\n".join(
-                                [
-                                    f"('{name}', {coordinates[name][0]}, {coordinates[name][0]})"
-                                    for name in batch_coordinates
-                                ]
-                            ) + ";\n"
-                        )
+                file.write("INSERT INTO dim_area (area_name, latitude, longitude) VALUES\n")
+                file.write(
+                    ",\n".join(
+                        [
+                            f"('{name}', {latitude}, {longtitude})"
+                            for (name, (latitude, longtitude)) in coordinates.items()
+                        ]
+                    ) + ";"
+                )
             areas_to_drop = missing_areas.difference(set(coordinates.keys()))
             dropping_index = vacancies_df[vacancies_df["area"].isin(areas_to_drop)]["id"].index
             vacancies_df.drop(dropping_index, inplace=True)
@@ -505,8 +507,9 @@ with DAG(
         employers_df['total_rating'], employers_df['reviews_count'] = zip(
             *employers_df['name'].apply(get_employer_ratings)
         )
+        employers_df['total_rating'] = employers_df['total_rating'].astype(int)
 
-        employers_df.to_csv(employers_path)
+        employers_df.to_csv(employers_path, index=False)
 
 
     @task(task_id="parsing_skills_from_habr")
@@ -723,7 +726,7 @@ with DAG(
             dbname=conn.schema
         )
         cursor = connection.cursor()
-        cursor.execute("select skill_id, skill_name from dim_skill")
+        cursor.execute("SELECT skill_id, skill_name FROM dim_skill")
         
         skills_db = {name.replace(" ", "_"): id for id, name in cursor.fetchall()}
         multiword_skills = [skill for skill in skills_db.keys() if "_" in skill]
@@ -792,8 +795,8 @@ with DAG(
         connection.close()
 
 
-    @task(task_id="load_vacancies_and_status_history")
-    def load_vacancies_and_status_history():
+    @task(task_id="load_vacancies")
+    def load_vacancies():
         conn = BaseHook.get_connection("vacancy_db")
         connection = psycopg2.connect(
             host=conn.host,
@@ -806,27 +809,36 @@ with DAG(
 
         vacancies_path = os.path.join(PROCESSED_PATH, "vacancies.csv")
         print(pd.read_csv(vacancies_path).info())
+
+        cursor.execute("TRUNCATE TABLE staging_vacancy")
+
         with open(vacancies_path, 'r') as file:
             cursor.copy_expert(
-                "COPY fact_vacancy FROM STDIN WITH CSV HEADER", file
+                """
+                    COPY staging_vacancy FROM STDIN WITH CSV HEADER
+                """, file
             )
-        
+
+        cursor.execute("""
+            INSERT INTO fact_vacancy
+            SELECT * FROM staging_vacancy
+            ON CONFLICT (vacancy_id) DO UPDATE SET
+                area_id = EXCLUDED.area_id,
+                role_id = EXCLUDED.role_id,
+                published_date = EXCLUDED.published_date,
+                created_date = EXCLUDED.created_date,
+                salary_from = EXCLUDED.salary_from,
+                salary_to = EXCLUDED.salary_to,
+                experience_id = EXCLUDED.experience_id,
+                employment_id = EXCLUDED.employment_id,
+                has_test = EXCLUDED.has_test,
+                is_internship = EXCLUDED.is_internship;
+        """)
+
         connection.commit()
 
-        vacancies_id = pd.read_csv(vacancies_path)["vacancy_id"]
-        buffer = StringIO()
-        vacancies_id.to_csv(buffer, index=False, header=False)
-        buffer.seek(0)
-        try:
-            copy_sql = f"COPY vacancy_status_history (vacancy_id) FROM STDIN WITH (FORMAT CSV)"
-            cursor.copy_expert(copy_sql, buffer)
-            connection.commit()
-        except (Exception, psycopg2.DatabaseError) as error:
-            connection.rollback()
-            print(f"Error during COPY vacancy_status_history: {error}")
-        finally:
-            cursor.close()
-            connection.close()
+        cursor.close()
+        connection.close()
 
 
     @task(task_id="load_vacancy_work_formats")
@@ -852,7 +864,13 @@ with DAG(
         output.seek(0)
 
         try:
-            cursor.copy_from(output, "bridge_vacancy_work_format", sep='\t', null='')
+            cursor.execute("TRUNCATE TABLE staging_vacancy_work_format")
+            cursor.copy_from(output, "staging_vacancy_work_format", sep='\t', null='')
+            cursor.execute("""
+                INSERT INTO bridge_vacancy_work_format
+                SELECT * FROM staging_vacancy_work_format
+                ON CONFLICT (vacancy_id, work_format_id) DO NOTHING
+            """)
             connection.commit()
         except Exception as e:
             conn.rollback()
@@ -876,10 +894,17 @@ with DAG(
         
         vacancy_skills_path = os.path.join(PROCESSED_PATH, "vacancy_skills.csv")
 
+        cursor.execute("TRUNCATE TABLE staging_vacancy_skill")
         with open(vacancy_skills_path, 'r') as file:
             cursor.copy_expert(
-                "COPY bridge_vacancy_skill FROM STDIN WITH CSV HEADER", file
+                "COPY staging_vacancy_skill FROM STDIN WITH CSV HEADER", file
             )
+
+        cursor.execute("""
+            INSERT INTO bridge_vacancy_skill
+            SELECT * FROM staging_vacancy_skill
+            ON CONFLICT (vacancy_id, skill_id) DO NOTHING
+        """)
 
         connection.commit()
         cursor.close()
@@ -979,12 +1004,12 @@ with DAG(
                 """
         )
 
-        load_vacancies_and_status_history_task = load_vacancies_and_status_history()
+        load_vacancies_task = load_vacancies()
         load_vacancy_work_formats_task = load_vacancy_work_formats()
         load_vacancy_skills_task = load_vacancy_skills()
 
-        load_employers_to_staging_task >> upsert_employers >> load_vacancies_and_status_history_task
-        load_vacancies_and_status_history_task >> [load_vacancy_work_formats_task, load_vacancy_skills_task]
+        load_employers_to_staging_task >> upsert_employers >> load_vacancies_task
+        load_vacancies_task >> [load_vacancy_work_formats_task, load_vacancy_skills_task]
 
 
     start = EmptyOperator(task_id="start")
